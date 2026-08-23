@@ -1,0 +1,15 @@
+[package]
+name = "ana-core"
+description = "Anaglyph 3D to full-colour stereo recovery — pure image maths, no I/O"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
