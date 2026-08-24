@@ -107,7 +107,7 @@ def main():
     shutil.copy2(icon, resources / "AppIcon.icns")
 
     # The licence has to travel with the binaries it covers.
-    shutil.copy2(ROOT / "COPYING", resources / "COPYING")
+    shutil.copy2(ROOT / "LICENSE", resources / "LICENSE")
 
     print("vendoring ffmpeg…")
     tools = []

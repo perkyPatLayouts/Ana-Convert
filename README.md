@@ -87,4 +87,4 @@ ColorCode anaglyph is not supported. Neither is interlaced output.
 ## Licence
 
 GPL-3.0-or-later, inherited from the original AviSynth scripts. The app bundles
-FFmpeg, also under the GPL. See [COPYING](COPYING).
+FFmpeg, also under the GPL. See [LICENSE](LICENSE).
