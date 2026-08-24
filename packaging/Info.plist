@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Stereoscopic Converter</string>
+	<key>CFBundleDisplayName</key>
+	<string>Stereoscopic Converter</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.vrtifacts.ana-convert</string>
+	<key>CFBundleExecutable</key>
+	<string>ana-convert-app</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+
+	<!-- Apple Silicon. The bundled ffmpeg is arm64 too. -->
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.video</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+
+	<!-- So a film can be dropped on the icon or opened with the app. -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Video</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.movie</string>
+				<string>public.video</string>
+				<string>public.mpeg-4</string>
+				<string>public.avi</string>
+				<string>org.matroska.mkv</string>
+			</array>
+		</dict>
+	</array>
+
+	<key>NSHumanReadableCopyright</key>
+	<string>GPL-3.0-or-later. Bundles FFmpeg, also under the GPL; source available on request.</string>
+</dict>
+</plist>
