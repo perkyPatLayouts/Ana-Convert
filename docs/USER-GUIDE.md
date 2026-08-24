@@ -35,7 +35,16 @@ This must match reality or nothing else will make sense.
 
 **An anaglyph** — one image with the two eyes encoded into colour channels.
 Choose the colour mode: red/cyan is much the most common, then green/magenta,
-then red/blue. Recovery settings apply.
+then red/blue, then ColorCode. Recovery settings apply.
+
+> **ColorCode 3-D** is the odd one out. Its amber filter passes red *and* green,
+> so the left eye keeps nearly all the brightness and recovers well; the right
+> eye gets blue alone, worth about seven percent of white's luminance. On the
+> test scene that is 27.3 dB against 16.1. The depth comes back and the left eye
+> looks good; the right eye is dim and noisy. That is the bargain the format
+> strikes, and no setting will undo it — though a 2D source used as the *right*
+> eye replaces the weak one outright, which is the one case where it matters
+> more than usual.
 
 **A side-by-side pair** or **a top-and-bottom pair** — already stereo. Nothing
 needs recovering; the two eyes are simply taken apart, and the Recovery section
@@ -163,7 +172,8 @@ grade exists to bring the *recovered* eye into line with the perfect one.
 
 **Anaglyph colour mode** is independent of the source's. Recovering a red/cyan
 transfer and writing green/magenta is perfectly reasonable — green/magenta holds
-colour better and ghosts less on many screens.
+colour better and ghosts less on many screens. ColorCode is also available, and
+gives the brightest, most colourful result of the four through its own glasses.
 
 **Eye order** says which eye is written first, labelled by position: *on the
 left* for side-by-side, *on top* for top-and-bottom.

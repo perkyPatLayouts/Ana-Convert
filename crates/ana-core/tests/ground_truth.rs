@@ -202,7 +202,11 @@ fn a_perfect_unblurred_reference_reproduces_that_eye_almost_exactly() {
     // survives the anaglyph intact and the reference *is* the left eye, so
     // with no colour blur in the way the output should be the original back.
     // Everything below this quality is the cost of blur, not of the pipeline.
-    for format in [AnaglyphFormat::RedCyan, AnaglyphFormat::GreenMagenta] {
+    for format in [
+        AnaglyphFormat::RedCyan,
+        AnaglyphFormat::GreenMagenta,
+        AnaglyphFormat::ColorCode,
+    ] {
         let (left, right) = (render_eye(0), render_eye(1));
         let anaglyph = encode_anaglyph(&left, &right, format);
         let pair = process_frame(
@@ -221,6 +225,42 @@ fn a_perfect_unblurred_reference_reproduces_that_eye_almost_exactly() {
             "{format:?} left eye only reached {score:.1} dB"
         );
     }
+}
+
+#[test]
+fn colorcode_recovers_its_amber_eye_well_and_its_blue_eye_poorly() {
+    // The bargain ColorCode strikes, measured. Amber passes red and green, so
+    // the left eye keeps nearly all the luminance and recovers cleanly. The
+    // right eye has only blue, which carries seven percent of white's
+    // brightness — the parallax survives, the picture does not.
+    let (left, right) = (render_eye(0), render_eye(1));
+    let anaglyph = encode_anaglyph(&left, &right, AnaglyphFormat::ColorCode);
+    let pair = process_frame(
+        Sources {
+            primary: &anaglyph,
+            right_eye: None,
+            colour: Some(&left),
+            mono: None,
+        },
+        &params_with_reference(AnaglyphFormat::ColorCode),
+    );
+
+    let (l, r) = (luma_psnr(&pair.left, &left), luma_psnr(&pair.right, &right));
+    eprintln!("ColorCode luma — amber eye {l:.1} dB, blue eye {r:.1} dB");
+    // Measured at 27.3 dB against 16.1 for the blue eye; the bar is a
+    // regression guard below that, not a target.
+    assert!(
+        l >= 25.0,
+        "the amber eye should recover well, got {l:.1} dB"
+    );
+    assert!(
+        l - r > 8.0,
+        "the gap between the eyes is the format's defining trait: {l:.1} vs {r:.1} dB"
+    );
+    assert!(
+        l > r,
+        "the amber eye must beat the blue one: {l:.1} vs {r:.1} dB"
+    );
 }
 
 #[test]

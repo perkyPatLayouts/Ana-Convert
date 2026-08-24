@@ -22,7 +22,7 @@ reworked to run in 32-bit float with a preview you can tune against.
 
 | From | To |
 |---|---|
-| Anaglyph (red/cyan, green/magenta, red/blue) | side-by-side, top-and-bottom, two files, one eye, anaglyph |
+| Anaglyph (red/cyan, green/magenta, red/blue, ColorCode) | side-by-side, top-and-bottom, two files, one eye, anaglyph |
 | Side-by-side or top-and-bottom, full or anamorphic | any of the above |
 | Two files, one per eye | any of the above |
 
@@ -75,7 +75,13 @@ far apart the anaglyph's colour at a pixel is composed from two different points
 in the scene; blur smears that error rather than resolving it. This is a limit
 of the method, not of the implementation.
 
-ColorCode anaglyph is not supported. Neither is interlaced output.
+ColorCode 3-D is supported, but note what the format itself throws away: its
+amber filter passes red and green, so the left eye recovers well while the right
+has only blue — about seven percent of white's brightness. Measured on the test
+scene, 27.3 dB against 16.1. The depth comes back; the right eye's picture does
+not.
+
+Interlaced output is not supported.
 
 ## Documentation
 

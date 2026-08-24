@@ -192,6 +192,8 @@ enum FormatArg {
     GreenMagenta,
     /// Red left, blue right.
     RedBlue,
+    /// ColorCode 3-D: amber left, dark blue right.
+    ColorCode,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -255,6 +257,7 @@ impl From<FormatArg> for AnaglyphFormat {
             FormatArg::RedCyan => Self::RedCyan,
             FormatArg::GreenMagenta => Self::GreenMagenta,
             FormatArg::RedBlue => Self::RedBlue,
+            FormatArg::ColorCode => Self::ColorCode,
         }
     }
 }

@@ -4,7 +4,7 @@
 //! Recovering a per-eye brightness signal from the anaglyph's colour channels.
 
 use crate::frame::FrameF32;
-use crate::transfer::{LUMA_B, LUMA_R};
+use crate::transfer::{LUMA_B, LUMA_G, LUMA_R};
 use rayon::prelude::*;
 
 /// Which anaglyph encoding the source uses.
@@ -19,6 +19,17 @@ pub enum AnaglyphFormat {
     GreenMagenta,
     /// Red left, blue right.
     RedBlue,
+    /// ColorCode 3-D: amber left, dark blue right.
+    ///
+    /// The amber filter passes red *and* green, so the left eye keeps almost
+    /// all the luminance and most of the colour. The right eye gets blue alone,
+    /// which carries barely seven percent of white's luminance — so it is dim,
+    /// and in most transfers the blue channel is the noisiest and most heavily
+    /// compressed of the three. The depth survives; the right eye's picture
+    /// does not survive well.
+    ///
+    /// Spelled the American way because it is a trade name, not a colour.
+    ColorCode,
 }
 
 /// The linear combination of RGB that one eye's filter lets through.
@@ -54,6 +65,9 @@ impl EyeProjection {
 /// to `v` rather than to the fraction of white's luminance it carries.
 const MAGENTA_NORM: f32 = 1.0 / (LUMA_R + LUMA_B);
 
+/// The same for amber, which is red plus green.
+const AMBER_NORM: f32 = 1.0 / (LUMA_R + LUMA_G);
+
 /// The `(left, right)` projections for an anaglyph encoding.
 pub fn projections(format: AnaglyphFormat) -> (EyeProjection, EyeProjection) {
     const RED: EyeProjection = EyeProjection {
@@ -79,10 +93,39 @@ pub fn projections(format: AnaglyphFormat) -> (EyeProjection, EyeProjection) {
         b: LUMA_B * MAGENTA_NORM,
     };
 
+    // Amber passes red and green, which between them carry 93% of white's
+    // luminance — which is the whole idea of ColorCode: one eye gets a nearly
+    // complete picture and the other supplies little more than parallax.
+    const AMBER: EyeProjection = EyeProjection {
+        r: LUMA_R * AMBER_NORM,
+        g: LUMA_G * AMBER_NORM,
+        b: 0.0,
+    };
+
     match format {
         AnaglyphFormat::RedCyan => (RED, GREEN),
         AnaglyphFormat::GreenMagenta => (GREEN, MAGENTA),
         AnaglyphFormat::RedBlue => (RED, BLUE),
+        AnaglyphFormat::ColorCode => (AMBER, BLUE),
+    }
+}
+
+impl AnaglyphFormat {
+    /// Every encoding, in the order a menu should list them.
+    pub const ALL: [AnaglyphFormat; 4] = [
+        Self::RedCyan,
+        Self::GreenMagenta,
+        Self::RedBlue,
+        Self::ColorCode,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RedCyan => "Red / cyan",
+            Self::GreenMagenta => "Green / magenta",
+            Self::RedBlue => "Red / blue",
+            Self::ColorCode => "ColorCode (amber / blue)",
+        }
     }
 }
 
@@ -127,6 +170,8 @@ pub fn encode_anaglyph(left: &FrameF32, right: &FrameF32, format: AnaglyphFormat
         AnaglyphFormat::GreenMagenta => FrameF32::from_rgb_planes(w, h, rr, lg, rb),
         // Neither filter passes green cleanly, so it follows the red eye.
         AnaglyphFormat::RedBlue => FrameF32::from_rgb_planes(w, h, lr, lg, rb),
+        // Amber is red plus green, both from the left eye; blue is the right.
+        AnaglyphFormat::ColorCode => FrameF32::from_rgb_planes(w, h, lr, lg, rb),
     }
 }
 
@@ -254,11 +299,7 @@ mod tests {
     fn encoding_then_extracting_returns_each_eye_projected_signal() {
         // The round trip that ties the two halves together: whatever an eye's
         // filter would have passed must survive being muxed and pulled apart.
-        for format in [
-            AnaglyphFormat::RedCyan,
-            AnaglyphFormat::GreenMagenta,
-            AnaglyphFormat::RedBlue,
-        ] {
+        for format in AnaglyphFormat::ALL {
             let (l, r) = pair();
             let (lp, rp) = projections(format);
             let (got_l, got_r) = extract_eyes(&encode_anaglyph(&l, &r, format), format);
@@ -299,14 +340,83 @@ mod tests {
     }
 
     #[test]
-    fn every_projection_weights_sum_to_one() {
-        // Restoration divides by a projected reference value, and both
-        // reconstructions only stay exact if a neutral grey projects to itself.
+    fn colorcode_left_is_an_amber_mix_of_red_and_green() {
+        // Amber passes both, weighted by what each contributes to brightness
+        // and renormalised so a neutral amber of value v yields v.
+        let (l, _) = eyes(0.6, 0.4, 0.9, AnaglyphFormat::ColorCode);
+        let expected = (0.2126 * 0.6 + 0.7152 * 0.4) / (0.2126 + 0.7152);
+        assert!((l - expected).abs() < 1e-6, "expected {expected}, got {l}");
+    }
+
+    #[test]
+    fn colorcode_left_ignores_blue() {
+        let quiet = eyes(0.6, 0.4, 0.0, AnaglyphFormat::ColorCode);
+        let noisy = eyes(0.6, 0.4, 1.0, AnaglyphFormat::ColorCode);
+        assert_eq!(quiet.0, noisy.0, "blue must not reach the amber eye");
+    }
+
+    #[test]
+    fn colorcode_right_is_the_blue_channel_alone() {
+        let (_, r) = eyes(0.6, 0.4, 0.9, AnaglyphFormat::ColorCode);
+        assert_eq!(r, 0.9);
+    }
+
+    #[test]
+    fn colorcode_amber_weights_green_far_above_red() {
+        // Which is why the amber eye keeps nearly all the luminance: green
+        // carries most of it.
+        let (green_only, _) = eyes(0.0, 1.0, 0.0, AnaglyphFormat::ColorCode);
+        let (red_only, _) = eyes(1.0, 0.0, 0.0, AnaglyphFormat::ColorCode);
+        assert!(
+            green_only > red_only * 3.0,
+            "green {green_only} should dominate red {red_only}"
+        );
+    }
+
+    #[test]
+    fn colorcode_preserves_a_neutral_level() {
+        let (l, _) = eyes(0.5, 0.5, 0.0, AnaglyphFormat::ColorCode);
+        assert!(
+            (l - 0.5).abs() < 1e-6,
+            "neutral amber must round-trip, got {l}"
+        );
+    }
+
+    #[test]
+    fn colorcode_differs_from_red_blue() {
+        // The distinction that makes it a separate format: red/blue gives the
+        // left eye red alone, ColorCode gives it red and green together.
+        let cc = eyes(0.6, 0.4, 0.9, AnaglyphFormat::ColorCode).0;
+        let rb = eyes(0.6, 0.4, 0.9, AnaglyphFormat::RedBlue).0;
+        assert!((cc - rb).abs() > 0.05, "ColorCode {cc} vs red/blue {rb}");
+    }
+
+    #[test]
+    fn colorcode_encodes_amber_from_the_left_and_blue_from_the_right() {
+        assert_eq!(encoded(AnaglyphFormat::ColorCode), [0.9, 0.5, 0.4]);
+    }
+
+    #[test]
+    fn every_format_is_offered_and_named() {
         for format in [
             AnaglyphFormat::RedCyan,
             AnaglyphFormat::GreenMagenta,
             AnaglyphFormat::RedBlue,
+            AnaglyphFormat::ColorCode,
         ] {
+            assert!(
+                AnaglyphFormat::ALL.contains(&format),
+                "{format:?} exists but is not offered"
+            );
+            assert!(!format.label().is_empty(), "{format:?} needs a label");
+        }
+    }
+
+    #[test]
+    fn every_projection_weights_sum_to_one() {
+        // Restoration divides by a projected reference value, and both
+        // reconstructions only stay exact if a neutral grey projects to itself.
+        for format in AnaglyphFormat::ALL {
             let (l, r) = projections(format);
             assert!(
                 (l.weight_sum() - 1.0).abs() < 1e-6,
@@ -323,11 +433,7 @@ mod tests {
     fn extraction_agrees_with_the_declared_projection() {
         // The invariant the whole recovery rests on.
         let px = [0.6, 0.35, 0.2];
-        for format in [
-            AnaglyphFormat::RedCyan,
-            AnaglyphFormat::GreenMagenta,
-            AnaglyphFormat::RedBlue,
-        ] {
+        for format in AnaglyphFormat::ALL {
             let (lp, rp) = projections(format);
             let (l, r) = eyes(px[0], px[1], px[2], format);
             assert!(

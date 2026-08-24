@@ -480,8 +480,8 @@ const HELP: &[(&str, &str)] = &[
     ),
     (
         "Source: what the file holds",
-        "An anaglyph — red/cyan, green/magenta or red/blue — needs recovering, and the \
-         Recovery settings apply.\n\n\
+        "An anaglyph — red/cyan, green/magenta, red/blue or ColorCode — needs \
+         recovering, and the Recovery settings apply.\n\n\
          A side-by-side or top-and-bottom pair is already stereo. Nothing needs recovering; \
          the two eyes are simply taken apart, and the Recovery settings are hidden because \
          they do not apply.",
@@ -543,7 +543,12 @@ const HELP: &[(&str, &str)] = &[
     ),
     (
         "Destination",
-        "Side by side and top and bottom are what stereo displays and headsets expect. Two \
+        "ColorCode 3-D is worth a note of its own. Its amber filter passes red and green, \
+         so the left eye keeps nearly all the brightness and recovers well; the right eye \
+         has only blue, which carries about seven percent of white's luminance. The depth \
+         comes back, the right eye's picture does not — that is the bargain the format \
+         strikes, not a fault in the conversion.\n\n\
+         Side by side and top and bottom are what stereo displays and headsets expect. Two \
          files gives one per eye. Anaglyph muxes the pair back for ordinary screens, and its \
          colour mode is independent of the source's — recovering a red/cyan transfer and \
          writing green/magenta is perfectly reasonable. Left or right eye alone gives a flat \
@@ -563,13 +568,6 @@ const HELP: &[(&str, &str)] = &[
          of each to the same visual moment is what keeps two differently edited releases \
          together — a cut is the easiest thing to match on.",
     ),
-];
-
-/// The anaglyph encodings, in the order a menu should list them.
-const ANAGLYPH_FORMATS: [AnaglyphFormat; 3] = [
-    AnaglyphFormat::RedCyan,
-    AnaglyphFormat::GreenMagenta,
-    AnaglyphFormat::RedBlue,
 ];
 
 /// A plain-language description of what the source is, for the header.
@@ -608,6 +606,10 @@ fn output_format_hint(format: AnaglyphFormat) -> &'static str {
         AnaglyphFormat::RedCyan => "The usual choice, and the glasses most people own.",
         AnaglyphFormat::GreenMagenta => {
             "Holds colour better than red/cyan and ghosts less on many screens."
+        }
+        AnaglyphFormat::ColorCode => {
+            "Amber and blue. The amber eye keeps nearly all the brightness and colour; \
+             the blue eye is dim, and carries little more than the parallax."
         }
         AnaglyphFormat::RedBlue => {
             "The oldest arrangement. Poor colour, but very forgiving glasses."
@@ -1032,7 +1034,7 @@ impl AnaApp {
                 egui::ComboBox::from_label("Colour mode")
                     .selected_text(format_name(self.params.input_format))
                     .show_ui(ui, |ui| {
-                        for f in ANAGLYPH_FORMATS {
+                        for f in AnaglyphFormat::ALL {
                             ui.selectable_value(&mut self.params.input_format, f, format_name(f));
                         }
                     });
@@ -1214,7 +1216,7 @@ impl AnaApp {
             egui::ComboBox::from_label("Anaglyph colour mode")
                 .selected_text(format_name(self.params.output_format))
                 .show_ui(ui, |ui| {
-                    for f in ANAGLYPH_FORMATS {
+                    for f in AnaglyphFormat::ALL {
                         ui.selectable_value(&mut self.params.output_format, f, format_name(f))
                             .on_hover_text(output_format_hint(f));
                     }
@@ -1705,11 +1707,7 @@ fn pick_save(current: Option<&Path>) -> Option<PathBuf> {
 }
 
 fn format_name(f: AnaglyphFormat) -> &'static str {
-    match f {
-        AnaglyphFormat::RedCyan => "Red / cyan",
-        AnaglyphFormat::GreenMagenta => "Green / magenta",
-        AnaglyphFormat::RedBlue => "Red / blue",
-    }
+    f.label()
 }
 
 fn transfer_name(t: TransferFunction) -> &'static str {
@@ -1979,12 +1977,9 @@ mod tests {
 
     #[test]
     fn every_enum_the_ui_offers_has_a_name() {
-        for f in [
-            AnaglyphFormat::RedCyan,
-            AnaglyphFormat::GreenMagenta,
-            AnaglyphFormat::RedBlue,
-        ] {
+        for f in AnaglyphFormat::ALL {
             assert!(!format_name(f).is_empty());
+            assert!(!output_format_hint(f).is_empty());
         }
         for c in [
             VideoCodec::H264VideoToolbox,

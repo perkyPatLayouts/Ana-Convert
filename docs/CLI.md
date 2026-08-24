@@ -54,7 +54,7 @@ layout would produce.
 | `--source <KIND>` | `anaglyph` (default), `sbs`, `tb`, `two-files` |
 | `--anamorphic` | Packed source squeezes each eye to half size |
 | `--right-eye <FILE>` | The other eye, with `--source two-files` |
-| `--format <MODE>` | Source anaglyph encoding: `red-cyan` (default), `green-magenta`, `red-blue` |
+| `--format <MODE>` | Source anaglyph encoding: `red-cyan` (default), `green-magenta`, `red-blue`, `color-code` |
 | `--colour <FILE>` | A 2D release to take colour from |
 | `--mono <FILE>` | A 2D release to use verbatim as one eye |
 | `--mono-eye <EYE>` | Which eye that is: `left` or `right` |
