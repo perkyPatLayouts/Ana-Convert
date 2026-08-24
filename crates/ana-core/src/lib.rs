@@ -22,6 +22,8 @@ pub mod compose;
 pub mod extract;
 pub mod grade;
 pub mod leak;
+pub mod packed;
 pub mod params;
 pub mod pipeline;
 pub mod restore;
+pub mod timecode;

@@ -32,12 +32,23 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    /// Opens a file for sequential decoding.
-    pub fn open(tools: &FfmpegTools, path: &Path, info: &VideoInfo) -> Result<Self, MediaError> {
+    /// Opens a file for sequential decoding from `start`.
+    ///
+    /// Seeking rather than discarding matters: a trim beginning half an hour
+    /// into a film would otherwise decode tens of thousands of frames just to
+    /// throw them away.
+    pub fn open_at(
+        tools: &FfmpegTools,
+        path: &Path,
+        info: &VideoInfo,
+        start: u64,
+    ) -> Result<Self, MediaError> {
         let depth = info.source_depth();
-        let mut child = Command::new(&tools.ffmpeg)
-            .args(["-nostdin", "-v", "error", "-i"])
-            .arg(path)
+        let mut command = Command::new(&tools.ffmpeg);
+        command.args(["-nostdin", "-v", "error"]);
+        apply_seek(&mut command, path, info, start);
+
+        let mut child = command
             .args([
                 "-f",
                 "rawvideo",
@@ -67,6 +78,11 @@ impl Decoder {
             buffer: vec![0u8; info.frame_bytes(depth)],
             frames_read: 0,
         })
+    }
+
+    /// Opens a file for sequential decoding from the beginning.
+    pub fn open(tools: &FfmpegTools, path: &Path, info: &VideoInfo) -> Result<Self, MediaError> {
+        Self::open_at(tools, path, info, 0)
     }
 
     /// Reads the next frame, or `None` at end of stream.
@@ -127,30 +143,7 @@ pub fn grab_frame(
     let depth = info.source_depth();
     let mut command = Command::new(&tools.ffmpeg);
     command.args(["-nostdin", "-v", "error"]);
-
-    // Seek to shortly before the target so ffmpeg can start at a keyframe,
-    // then select the exact frame from there. Seeking straight to the frame's
-    // own timestamp risks landing a frame early or late on long-GOP sources.
-    if index > 0 && info.fps > 0.0 {
-        let lead_in = 1.0_f64.min(index as f64 / info.fps);
-        let seek_to = (index as f64 / info.fps) - lead_in;
-        let skip = (lead_in * info.fps).round() as u64;
-        command
-            .args(["-ss", &format!("{seek_to:.6}")])
-            .arg("-i")
-            .arg(path)
-            // `-fps_mode passthrough` stops ffmpeg duplicating or dropping
-            // frames to hit a target rate. It replaced `-vsync`, which was
-            // removed in ffmpeg 8.
-            .args([
-                "-vf",
-                &format!("select=gte(n\\,{skip})"),
-                "-fps_mode",
-                "passthrough",
-            ]);
-    } else {
-        command.arg("-i").arg(path);
-    }
+    apply_seek(&mut command, path, info, index);
 
     let out = command
         .args([
@@ -188,6 +181,36 @@ pub fn grab_frame(
         info.height,
         depth,
     ))
+}
+
+/// Points ffmpeg at `path`, starting output at frame `index`.
+///
+/// Shared by both entry points so that "frame N" means exactly one thing: the
+/// preview and the render must never disagree about which frame they are on.
+///
+/// Seeks to shortly before the target so ffmpeg can start from a keyframe, then
+/// selects the exact frame. Seeking straight to the frame's own timestamp risks
+/// landing early or late on long-GOP sources.
+fn apply_seek(command: &mut Command, path: &Path, info: &VideoInfo, index: u64) {
+    if index == 0 || info.fps <= 0.0 {
+        command.arg("-i").arg(path);
+        return;
+    }
+    let lead_in = 1.0_f64.min(index as f64 / info.fps);
+    let seek_to = (index as f64 / info.fps) - lead_in;
+    let skip = (lead_in * info.fps).round() as u64;
+    command
+        .args(["-ss", &format!("{seek_to:.6}")])
+        .arg("-i")
+        .arg(path)
+        // `-fps_mode passthrough` stops ffmpeg duplicating or dropping frames
+        // to hit a target rate. It replaced `-vsync`, removed in ffmpeg 8.
+        .args([
+            "-vf",
+            &format!(r"select=gte(n\,{skip})"),
+            "-fps_mode",
+            "passthrough",
+        ]);
 }
 
 /// Converts one raw frame's bytes into a float frame.
@@ -371,6 +394,78 @@ mod tests {
     }
 
     #[test]
+    fn opening_at_a_frame_starts_there() {
+        // The frame a seeked decoder hands over first must be the same one
+        // grab_frame would return, or a trimmed render silently starts in the
+        // wrong place.
+        let t = tools();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clip = dir.path().join("clip.mkv");
+        make_test_clip(&t, &clip, 64, 48, 30, 10.0);
+        let info = probe(&t, &clip).expect("probe");
+
+        for start in [0u64, 1, 7, 20] {
+            let mut decoder = Decoder::open_at(&t, &clip, &info, start).expect("open");
+            let got = decoder.next_frame().expect("decode").expect("a frame");
+            let want = grab_frame(&t, &clip, &info, start).expect("grab");
+            assert_eq!(
+                got.as_slice(),
+                want.as_slice(),
+                "seeking to {start} landed on a different frame"
+            );
+        }
+    }
+
+    #[test]
+    fn a_seeked_decoder_yields_the_rest_of_the_file() {
+        let t = tools();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clip = dir.path().join("clip.mkv");
+        make_test_clip(&t, &clip, 64, 48, 20, 10.0);
+        let info = probe(&t, &clip).expect("probe");
+
+        let mut decoder = Decoder::open_at(&t, &clip, &info, 12).expect("open");
+        let mut count = 0;
+        while decoder.next_frame().expect("decode").is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 8, "20 frames starting at 12 leaves 8");
+    }
+
+    #[test]
+    fn a_seeked_decoder_stays_in_step_with_sequential_decoding() {
+        let t = tools();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clip = dir.path().join("clip.mkv");
+        make_test_clip(&t, &clip, 48, 32, 24, 10.0);
+        let info = probe(&t, &clip).expect("probe");
+
+        let mut plain = Decoder::open(&t, &clip, &info).expect("open");
+        let mut from_five = Decoder::open_at(&t, &clip, &info, 5).expect("open");
+        for _ in 0..5 {
+            plain.next_frame().expect("decode");
+        }
+        // Both are now at frame 5; they must stay together from here.
+        for step in 0..6 {
+            let a = plain.next_frame().expect("decode").expect("frame");
+            let b = from_five.next_frame().expect("decode").expect("frame");
+            assert_eq!(a.as_slice(), b.as_slice(), "diverged {step} frames in");
+        }
+    }
+
+    #[test]
+    fn seeking_past_the_end_yields_nothing_rather_than_failing() {
+        let t = tools();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clip = dir.path().join("clip.mkv");
+        make_test_clip(&t, &clip, 32, 32, 6, 10.0);
+        let info = probe(&t, &clip).expect("probe");
+
+        let mut decoder = Decoder::open_at(&t, &clip, &info, 500).expect("open");
+        assert!(decoder.next_frame().expect("decode").is_none());
+    }
+
+    #[test]
     fn opening_a_missing_file_is_an_error() {
         let t = tools();
         let info = VideoInfo {
@@ -379,6 +474,7 @@ mod tests {
             fps: 10.0,
             frame_count: Some(1),
             duration_secs: Some(0.1),
+            sample_aspect: 1.0,
             bit_depth: 8,
             pix_fmt: "yuv420p".into(),
             has_audio: false,

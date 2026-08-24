@@ -16,11 +16,18 @@ use crate::{FfmpegTools, MediaError};
 pub struct VideoInfo {
     pub width: usize,
     pub height: usize,
-    /// Frames per second, from `r_frame_rate` where it is usable.
+    /// Frames per second, from `avg_frame_rate` where it is usable.
     pub fps: f64,
     /// Frame count as reported by the container, when it reports one at all.
     pub frame_count: Option<u64>,
     pub duration_secs: Option<f64>,
+    /// Pixel aspect ratio: the shape of one stored pixel.
+    ///
+    /// Not always square. A DVD-sourced transfer routinely stores 708x276 with
+    /// 8:9 pixels, meaning it displays narrower than its stored dimensions
+    /// suggest. Raw video carries no such metadata, so this has to be read here
+    /// and put back at encode time or every output comes out stretched.
+    pub sample_aspect: f64,
     /// Bits per component in the source, derived from the pixel format.
     pub bit_depth: u8,
     pub pix_fmt: String,
@@ -55,6 +62,14 @@ impl SourceDepth {
 }
 
 impl VideoInfo {
+    /// The shape the frame is meant to be seen at, accounting for pixel shape.
+    pub fn display_aspect(&self) -> f64 {
+        if self.height == 0 {
+            return 1.0;
+        }
+        self.width as f64 * self.sample_aspect / self.height as f64
+    }
+
     /// Which raw format to decode into: enough to carry the source without
     /// wasting pipe bandwidth on sources that never had the precision.
     pub fn source_depth(&self) -> SourceDepth {
@@ -153,9 +168,13 @@ pub(crate) fn parse_probe_json(json: &str) -> Result<VideoInfo, MediaError> {
         .ok_or_else(|| MediaError::ProbeParse("video stream has no height".into()))?
         as usize;
 
-    // r_frame_rate is the more accurate of the two, but is "0/0" on some
-    // sources, in which case the average is all there is.
-    let fps = ["r_frame_rate", "avg_frame_rate"]
+    // avg_frame_rate first, deliberately. r_frame_rate is the lowest rate that
+    // can represent every timestamp, which on a real 29.97 disc rip reads as a
+    // round 30 — enough to seek nearly six frames wrong three minutes in, and
+    // to drift the audio across a feature. avg_frame_rate is frames over
+    // duration, which is exactly the frame-to-time mapping seeking needs.
+    // It is "0/0" on some sources, hence the fallback.
+    let fps = ["avg_frame_rate", "r_frame_rate"]
         .iter()
         .filter_map(|key| video.get(*key).and_then(|v| v.as_str()))
         .find_map(parse_rational)
@@ -178,6 +197,7 @@ pub(crate) fn parse_probe_json(json: &str) -> Result<VideoInfo, MediaError> {
         width,
         height,
         fps,
+        sample_aspect: pixel_aspect(video, width, height),
         frame_count: uint(video, "nb_frames").filter(|&n| n > 0),
         duration_secs,
         bit_depth,
@@ -186,10 +206,36 @@ pub(crate) fn parse_probe_json(json: &str) -> Result<VideoInfo, MediaError> {
     })
 }
 
-/// Evaluates ffprobe's `"24000/1001"` style rationals. `None` for unusable
-/// values like `"0/0"`, so the caller can try the next field.
+/// The shape of one stored pixel.
+///
+/// Preferring `sample_aspect_ratio` because it states the fact directly. Some
+/// containers give only `display_aspect_ratio` — what the picture should look
+/// like — which the pixel shape can be worked back out of. Failing both, square.
+fn pixel_aspect(video: &serde_json::Value, width: usize, height: usize) -> f64 {
+    let stated = |key: &str| {
+        video
+            .get(key)
+            .and_then(|v| v.as_str())
+            .and_then(parse_rational)
+    };
+    if let Some(sar) = stated("sample_aspect_ratio") {
+        return sar;
+    }
+    if let Some(dar) = stated("display_aspect_ratio") {
+        if width > 0 {
+            return dar * height as f64 / width as f64;
+        }
+    }
+    1.0
+}
+
+/// Evaluates ffprobe's rationals. Frame rates arrive as `"24000/1001"` and
+/// aspect ratios as `"8:9"`, so both separators are accepted.
+///
+/// `None` for unusable values like `"0/0"`, `"0:1"` or `"N/A"`, so the caller
+/// can fall back to something sensible.
 fn parse_rational(text: &str) -> Option<f64> {
-    let (num, den) = text.split_once('/')?;
+    let (num, den) = text.split_once(['/', ':'])?;
     let (num, den): (f64, f64) = (num.parse().ok()?, den.parse().ok()?);
     if den == 0.0 || num == 0.0 {
         return None;
@@ -240,8 +286,10 @@ mod tests {
     #[test]
     fn a_fractional_frame_rate_is_evaluated() {
         // 23.976 arrives as a rational and must not be truncated to 23.
-        let json =
-            video_stream("").replace(r#""r_frame_rate":"24/1""#, r#""r_frame_rate":"24000/1001""#);
+        let json = video_stream("").replace(
+            r#""avg_frame_rate":"24/1""#,
+            r#""avg_frame_rate":"24000/1001""#,
+        );
         let info = parse_probe_json(&json).expect("parse");
         assert!((info.fps - 23.976).abs() < 0.001, "got {}", info.fps);
     }
@@ -256,10 +304,32 @@ mod tests {
     }
 
     #[test]
-    fn an_unusable_frame_rate_falls_back_to_the_average() {
-        let json = video_stream("").replace(r#""r_frame_rate":"24/1""#, r#""r_frame_rate":"0/0""#);
+    fn an_unusable_frame_rate_falls_back_to_the_other_field() {
+        let json =
+            video_stream("").replace(r#""avg_frame_rate":"24/1""#, r#""avg_frame_rate":"0/0""#);
         let info = parse_probe_json(&json).expect("parse");
-        assert_eq!(info.fps, 24.0, "should have used avg_frame_rate");
+        assert_eq!(info.fps, 24.0, "should have fallen back to r_frame_rate");
+    }
+
+    #[test]
+    fn the_average_rate_wins_when_the_two_disagree() {
+        // Taken from a real disc rip: r_frame_rate claims a round 30 while the
+        // file actually runs at 29.9687. r_frame_rate is the lowest rate that
+        // can represent every timestamp, not the rate the film runs at, so
+        // trusting it puts frame 5850 nearly six frames early — enough to seek
+        // to the wrong shot and to drift the audio over a feature.
+        let json = video_stream("")
+            .replace(r#""r_frame_rate":"24/1""#, r#""r_frame_rate":"30/1""#)
+            .replace(
+                r#""avg_frame_rate":"24/1""#,
+                r#""avg_frame_rate":"181650000/6061319""#,
+            );
+        let info = parse_probe_json(&json).expect("parse");
+        assert!(
+            (info.fps - 29.9687).abs() < 0.001,
+            "expected the true 29.9687, got {}",
+            info.fps
+        );
     }
 
     #[test]
@@ -292,6 +362,70 @@ mod tests {
         let info = parse_probe_json(&video_stream("")).expect("parse");
         assert_eq!(info.frame_bytes(SourceDepth::Eight), 1920 * 1080 * 3);
         assert_eq!(info.frame_bytes(SourceDepth::Sixteen), 1920 * 1080 * 6);
+    }
+
+    #[test]
+    fn square_pixels_are_assumed_when_nothing_says_otherwise() {
+        let info = parse_probe_json(&video_stream("")).expect("parse");
+        assert_eq!(info.sample_aspect, 1.0);
+        assert!((info.display_aspect() - 16.0 / 9.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn non_square_pixels_are_read_and_change_the_display_shape() {
+        // Straight from a real transfer: 708x276 stored, 8:9 pixels, so it
+        // displays at 2.28:1 rather than the 2.57:1 the stored size implies.
+        let json = video_stream(r#","sample_aspect_ratio":"8:9""#)
+            .replace(r#""width":1920"#, r#""width":708"#)
+            .replace(r#""height":1080"#, r#""height":276"#);
+        let info = parse_probe_json(&json).expect("parse");
+        assert!(
+            (info.sample_aspect - 8.0 / 9.0).abs() < 1e-6,
+            "got {}",
+            info.sample_aspect
+        );
+        assert!(
+            (info.display_aspect() - 472.0 / 207.0).abs() < 1e-3,
+            "expected 2.28:1, got {}",
+            info.display_aspect()
+        );
+    }
+
+    #[test]
+    fn a_declared_display_shape_is_used_when_the_pixel_shape_is_missing() {
+        // Some containers state only what the picture should look like, not
+        // what shape its pixels are. Assuming square in that case gets the
+        // whole frame wrong — a 720x480 transfer meant to be seen at 4:3 has
+        // 8:9 pixels, and treating them as square makes it 11% too wide.
+        let json = video_stream(r#","display_aspect_ratio":"4:3""#)
+            .replace(r#""width":1920"#, r#""width":720"#)
+            .replace(r#""height":1080"#, r#""height":480"#);
+        let info = parse_probe_json(&json).expect("parse");
+        assert!(
+            (info.sample_aspect - 8.0 / 9.0).abs() < 1e-6,
+            "expected 8:9 pixels derived from the 4:3 display shape, got {}",
+            info.sample_aspect
+        );
+        assert!((info.display_aspect() - 4.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_stated_pixel_shape_wins_over_a_stated_display_shape() {
+        // Both present and disagreeing: the pixel shape is the primary fact.
+        let json = video_stream(r#","sample_aspect_ratio":"1:1","display_aspect_ratio":"4:3""#);
+        let info = parse_probe_json(&json).expect("parse");
+        assert_eq!(info.sample_aspect, 1.0);
+    }
+
+    #[test]
+    fn an_unset_pixel_aspect_falls_back_to_square() {
+        for value in [
+            r#","sample_aspect_ratio":"0:1""#,
+            r#","sample_aspect_ratio":"N/A""#,
+        ] {
+            let info = parse_probe_json(&video_stream(value)).expect("parse");
+            assert_eq!(info.sample_aspect, 1.0, "for {value}");
+        }
     }
 
     #[test]

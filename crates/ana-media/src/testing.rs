@@ -1,13 +1,12 @@
 // Ana-Convert — anaglyph 3D to full-colour stereo recovery
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Fixtures for the crate's own tests.
+//! Fixtures for tests, in this crate and in sibling crates that enable the
+//! `fixtures` feature.
 //!
 //! Generating clips with ffmpeg beats checking binaries into the repository:
 //! the fixtures stay small, their contents are described in one place, and
 //! they exercise the same decode path a real file would.
-
-#![cfg(test)]
 
 use std::path::Path;
 use std::process::Command;
@@ -47,6 +46,35 @@ pub fn make_test_clip(
             "yuv420p",
             "-c:a",
             "aac",
+            &path.to_string_lossy(),
+        ],
+    );
+}
+
+/// Writes a short clip with no audio track at all.
+pub fn make_silent_clip(
+    tools: &FfmpegTools,
+    path: &Path,
+    width: usize,
+    height: usize,
+    frames: usize,
+    fps: f64,
+) {
+    let duration = frames as f64 / fps;
+    run(
+        tools,
+        &[
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc2=size={width}x{height}:rate={fps}:duration={duration}"),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
             &path.to_string_lossy(),
         ],
     );

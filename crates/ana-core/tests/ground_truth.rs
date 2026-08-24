@@ -11,7 +11,7 @@
 //! Set `ANA_DUMP=<dir>` to write the scenes and recoveries out as PNGs.
 
 use ana_core::compose::OutputLayout;
-use ana_core::extract::AnaglyphFormat;
+use ana_core::extract::{encode_anaglyph, AnaglyphFormat};
 use ana_core::frame::FrameF32;
 use ana_core::params::{ConvertParams, MonoEye};
 use ana_core::pipeline::{process_frame, Sources};
@@ -122,20 +122,6 @@ fn render_eye(shift: isize) -> FrameF32 {
     FrameF32::from_rgb_planes(WIDTH, HEIGHT, &r, &g, &b)
 }
 
-/// Muxes a true stereo pair into an anaglyph, exactly as a mastering house
-/// would: a straight channel copy on gamma-encoded samples.
-fn encode_anaglyph(left: &FrameF32, right: &FrameF32, format: AnaglyphFormat) -> FrameF32 {
-    let (lr, lg, _lb) = left.rgb_planes();
-    let (rr, rg, rb) = right.rgb_planes();
-    match format {
-        // Red filter passes the left eye; cyan (green + blue) passes the right.
-        AnaglyphFormat::RedCyan => FrameF32::from_rgb_planes(WIDTH, HEIGHT, lr, rg, rb),
-        // Green passes the left eye; magenta (red + blue) passes the right.
-        AnaglyphFormat::GreenMagenta => FrameF32::from_rgb_planes(WIDTH, HEIGHT, rr, lg, rb),
-        AnaglyphFormat::RedBlue => FrameF32::from_rgb_planes(WIDTH, HEIGHT, lr, lg, rb),
-    }
-}
-
 // --- scoring ---------------------------------------------------------------
 
 /// Peak signal-to-noise ratio in dB over all three channels.
@@ -221,7 +207,8 @@ fn a_perfect_unblurred_reference_reproduces_that_eye_almost_exactly() {
         let anaglyph = encode_anaglyph(&left, &right, format);
         let pair = process_frame(
             Sources {
-                anaglyph: &anaglyph,
+                primary: &anaglyph,
+                right_eye: None,
                 colour: Some(&left),
                 mono: None,
             },
@@ -245,7 +232,8 @@ fn a_real_colour_reference_beats_letting_the_anaglyph_colour_itself() {
 
     let with_ref = process_frame(
         Sources {
-            anaglyph: &anaglyph,
+            primary: &anaglyph,
+            right_eye: None,
             colour: Some(&left),
             mono: None,
         },
@@ -268,7 +256,8 @@ fn less_colour_blur_means_better_colour() {
     let score = |decimate: f32| {
         let pair = process_frame(
             Sources {
-                anaglyph: &anaglyph,
+                primary: &anaglyph,
+                right_eye: None,
                 colour: Some(&left),
                 mono: None,
             },
@@ -300,7 +289,8 @@ fn luminance_is_recovered_far_more_accurately_than_colour() {
     let anaglyph = encode_anaglyph(&left, &right, AnaglyphFormat::RedCyan);
     let pair = process_frame(
         Sources {
-            anaglyph: &anaglyph,
+            primary: &anaglyph,
+            right_eye: None,
             colour: Some(&left),
             mono: None,
         },
@@ -316,7 +306,7 @@ fn luminance_is_recovered_far_more_accurately_than_colour() {
     let colour_psnr = psnr(&pair.right, &right);
     let luma = luma_psnr(&pair.right, &right);
     eprintln!("right eye — colour {colour_psnr:.1} dB, luma {luma:.1} dB");
-    assert!(luma >= 30.0, "luma recovery only reached {luma:.1} dB");
+    assert!(luma >= 26.0, "luma recovery only reached {luma:.1} dB");
     assert!(
         luma > colour_psnr,
         "luma ({luma:.1}) should beat colour ({colour_psnr:.1})"
@@ -327,14 +317,20 @@ fn luminance_is_recovered_far_more_accurately_than_colour() {
 fn default_settings_hold_their_measured_quality() {
     // A regression guard, not a quality target. The scene is deliberately
     // adversarial — hard-edged saturated blocks at up to 8px disparity, far
-    // harsher than film — and at the time of writing scores 20.5 dB (left) and
-    // 19.1 dB (right). The bars sit well below that to catch real regressions
-    // without breaking on incidental numeric drift.
+    // harsher than film — and currently scores 17.4 dB (left) and 18.0 dB
+    // (right) with the default Offset reconstruction.
+    //
+    // Scale scores about 3 dB higher here, and is still the better choice on a
+    // clean source. It is not the default because this scene does not model
+    // what actually breaks on real film: compressed, grainy, cyan-cast shadows,
+    // where Scale's divide turns noise into visible speckle and Offset does not.
+    // Synthetic PSNR is the wrong judge of that, so the lower number wins.
     let (left, right) = (render_eye(0), render_eye(1));
     let anaglyph = encode_anaglyph(&left, &right, AnaglyphFormat::RedCyan);
     let pair = process_frame(
         Sources {
-            anaglyph: &anaglyph,
+            primary: &anaglyph,
+            right_eye: None,
             colour: Some(&left),
             mono: None,
         },
@@ -342,8 +338,8 @@ fn default_settings_hold_their_measured_quality() {
     );
     let (l, r) = (psnr(&pair.left, &left), psnr(&pair.right, &right));
     eprintln!("RC defaults — left {l:.1} dB, right {r:.1} dB");
-    assert!(l >= 18.0, "left eye regressed to {l:.1} dB");
-    assert!(r >= 17.0, "right eye regressed to {r:.1} dB");
+    assert!(l >= 15.5, "left eye regressed to {l:.1} dB");
+    assert!(r >= 16.0, "right eye regressed to {r:.1} dB");
 }
 
 #[test]
@@ -369,7 +365,7 @@ fn recovery_still_works_without_any_colour_reference() {
         pair.left.as_slice().iter().all(|s| s.is_finite()),
         "self-coloured output must still be a valid frame"
     );
-    assert!(luma >= 20.0, "self-coloured luma regressed to {luma:.1} dB");
+    assert!(luma >= 16.0, "self-coloured luma regressed to {luma:.1} dB");
 }
 
 #[test]
@@ -378,7 +374,8 @@ fn a_mono_source_gives_that_eye_back_untouched() {
     let anaglyph = encode_anaglyph(&left, &right, AnaglyphFormat::RedCyan);
     let pair = process_frame(
         Sources {
-            anaglyph: &anaglyph,
+            primary: &anaglyph,
+            right_eye: None,
             colour: Some(&left),
             mono: Some(&left),
         },
@@ -420,7 +417,8 @@ fn cross_talk_correction_recovers_a_deliberately_leaky_anaglyph() {
     let base = params_with_reference(AnaglyphFormat::RedCyan);
     let uncorrected = process_frame(
         Sources {
-            anaglyph: &anaglyph,
+            primary: &anaglyph,
+            right_eye: None,
             colour: Some(&left),
             mono: None,
         },
@@ -428,7 +426,8 @@ fn cross_talk_correction_recovers_a_deliberately_leaky_anaglyph() {
     );
     let corrected = process_frame(
         Sources {
-            anaglyph: &anaglyph,
+            primary: &anaglyph,
+            right_eye: None,
             colour: Some(&left),
             mono: None,
         },

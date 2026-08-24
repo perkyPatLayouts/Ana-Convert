@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/ana-core", "crates/ana-media"]
+members = [
+    "crates/ana-core",
+    "crates/ana-media",
+    "crates/ana-pipeline",
+    "crates/ana-cli",
+]
 
 [workspace.package]
 version = "0.1.0"

@@ -105,6 +105,31 @@ pub fn extract_eyes(anaglyph: &FrameF32, format: AnaglyphFormat) -> (FrameF32, F
     (project(left), project(right))
 }
 
+/// Muxes a full-colour stereo pair back into an anaglyph.
+///
+/// The inverse of [`extract_eyes`], and exactly what a mastering house did in
+/// the first place: a straight channel copy. Two uses — building test material
+/// whose true answer is known, and letting the app show a recovered pair back
+/// through the glasses as a check.
+pub fn encode_anaglyph(left: &FrameF32, right: &FrameF32, format: AnaglyphFormat) -> FrameF32 {
+    assert!(
+        left.same_size(right),
+        "the two eyes must be the same size to mux"
+    );
+    let (w, h) = (left.width(), left.height());
+    let (lr, lg, _) = left.rgb_planes();
+    let (rr, rg, rb) = right.rgb_planes();
+
+    match format {
+        // Red passes the left eye; cyan — green and blue — passes the right.
+        AnaglyphFormat::RedCyan => FrameF32::from_rgb_planes(w, h, lr, rg, rb),
+        // Green passes the left eye; magenta — red and blue — passes the right.
+        AnaglyphFormat::GreenMagenta => FrameF32::from_rgb_planes(w, h, rr, lg, rb),
+        // Neither filter passes green cleanly, so it follows the red eye.
+        AnaglyphFormat::RedBlue => FrameF32::from_rgb_planes(w, h, lr, lg, rb),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +220,82 @@ mod tests {
         let (l, r) = extract_eyes(&anaglyph, AnaglyphFormat::RedCyan);
         assert_eq!(l.plane(0), &[0.1, 0.2, 0.3]);
         assert_eq!(r.plane(0), &[0.4, 0.5, 0.6]);
+    }
+
+    fn pair() -> (FrameF32, FrameF32) {
+        let left = FrameF32::from_rgb_planes(1, 1, &[0.9], &[0.5], &[0.1]);
+        let right = FrameF32::from_rgb_planes(1, 1, &[0.2], &[0.7], &[0.4]);
+        (left, right)
+    }
+
+    fn encoded(format: AnaglyphFormat) -> [f32; 3] {
+        let (l, r) = pair();
+        let a = encode_anaglyph(&l, &r, format);
+        let (ar, ag, ab) = a.rgb_planes();
+        [ar[0], ag[0], ab[0]]
+    }
+
+    #[test]
+    fn red_cyan_takes_red_from_the_left_and_cyan_from_the_right() {
+        assert_eq!(encoded(AnaglyphFormat::RedCyan), [0.9, 0.7, 0.4]);
+    }
+
+    #[test]
+    fn green_magenta_takes_green_from_the_left_and_magenta_from_the_right() {
+        assert_eq!(encoded(AnaglyphFormat::GreenMagenta), [0.2, 0.5, 0.4]);
+    }
+
+    #[test]
+    fn red_blue_takes_blue_from_the_right() {
+        assert_eq!(encoded(AnaglyphFormat::RedBlue), [0.9, 0.5, 0.4]);
+    }
+
+    #[test]
+    fn encoding_then_extracting_returns_each_eye_projected_signal() {
+        // The round trip that ties the two halves together: whatever an eye's
+        // filter would have passed must survive being muxed and pulled apart.
+        for format in [
+            AnaglyphFormat::RedCyan,
+            AnaglyphFormat::GreenMagenta,
+            AnaglyphFormat::RedBlue,
+        ] {
+            let (l, r) = pair();
+            let (lp, rp) = projections(format);
+            let (got_l, got_r) = extract_eyes(&encode_anaglyph(&l, &r, format), format);
+
+            let want_l = lp.apply(l.plane(0)[0], l.plane(1)[0], l.plane(2)[0]);
+            let want_r = rp.apply(r.plane(0)[0], r.plane(1)[0], r.plane(2)[0]);
+            assert!(
+                (got_l.plane(0)[0] - want_l).abs() < 1e-6,
+                "{format:?} left: {} vs {want_l}",
+                got_l.plane(0)[0]
+            );
+            assert!(
+                (got_r.plane(0)[0] - want_r).abs() < 1e-6,
+                "{format:?} right: {} vs {want_r}",
+                got_r.plane(0)[0]
+            );
+        }
+    }
+
+    #[test]
+    fn encoding_preserves_geometry() {
+        let a = encode_anaglyph(
+            &FrameF32::new_rgb(6, 4),
+            &FrameF32::new_rgb(6, 4),
+            AnaglyphFormat::RedCyan,
+        );
+        assert_eq!((a.width(), a.height(), a.channels()), (6, 4, 3));
+    }
+
+    #[test]
+    #[should_panic(expected = "same size")]
+    fn encoding_rejects_mismatched_eyes() {
+        encode_anaglyph(
+            &FrameF32::new_rgb(6, 4),
+            &FrameF32::new_rgb(4, 6),
+            AnaglyphFormat::RedCyan,
+        );
     }
 
     #[test]

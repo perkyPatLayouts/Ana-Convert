@@ -14,6 +14,7 @@ use crate::blur::{sigma_from_decimate, sigma_from_shrink};
 use crate::compose::{EyeOrder, OutputLayout};
 use crate::extract::AnaglyphFormat;
 use crate::grade::Grade;
+use crate::packed::StereoPacking;
 use crate::restore::ColourRestore;
 use crate::transfer::TransferFunction;
 
@@ -30,12 +31,139 @@ pub enum MonoEye {
     Right,
 }
 
+/// Which part of one source file to use.
+///
+/// A 2D release and the anaglyph it accompanies rarely start on the same
+/// frame — different distributors, different logos, different credit rolls —
+/// and may not run the same length either. Giving every source its own range
+/// says "these two frames are the same moment" without assuming anything about
+/// what came before.
+///
+/// `end` is inclusive, because it names a frame someone looked at and marked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SourceTrim {
+    /// First frame to read from this source.
+    pub start: u64,
+    /// Last frame to read, inclusive. `None` runs to the end of the file.
+    pub end: Option<u64>,
+}
+
+impl SourceTrim {
+    /// A trim that uses the whole file.
+    pub fn whole() -> Self {
+        Self::default()
+    }
+
+    /// True when this uses the whole file, so the UI can stay quiet about it.
+    pub fn is_whole(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// How many frames this trim yields from a source of `total` frames.
+    ///
+    /// Zero for a range that starts past the end or finishes before it starts,
+    /// rather than an error: a half-set alignment should stop the render, not
+    /// crash it.
+    pub fn length(&self, total: u64) -> u64 {
+        let last = match self.end {
+            Some(end) => end.min(total.saturating_sub(1)),
+            None => total.saturating_sub(1),
+        };
+        if total == 0 || self.start > last {
+            return 0;
+        }
+        last - self.start + 1
+    }
+
+    /// The absolute frame `offset` frames into this trim.
+    pub fn frame_at(&self, offset: u64) -> u64 {
+        self.start.saturating_add(offset)
+    }
+
+    /// How far into this trim an absolute frame sits, if it is inside at all.
+    pub fn offset_of(&self, frame: u64) -> Option<u64> {
+        if frame < self.start {
+            return None;
+        }
+        match self.end {
+            Some(end) if frame > end => None,
+            _ => Some(frame - self.start),
+        }
+    }
+}
+
+/// What the input file holds, and therefore what has to be done to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum InputMode {
+    /// A red/cyan, green/magenta or red/blue anaglyph, to be recovered.
+    #[default]
+    Anaglyph,
+    /// A stereo pair already packed into one frame. Nothing needs recovering —
+    /// the two eyes only have to be taken apart.
+    Packed {
+        packing: StereoPacking,
+        /// Which eye is stored first.
+        order: EyeOrder,
+        /// Each eye is squeezed to half size and must be stretched back.
+        anamorphic: bool,
+    },
+    /// Two files, one per eye. Nothing needs recovering or splitting; the pair
+    /// is simply read from two places at once.
+    TwoFiles,
+}
+
+impl InputMode {
+    /// A packed source with the usual arrangement.
+    pub fn packed(packing: StereoPacking, anamorphic: bool) -> Self {
+        Self::Packed {
+            packing,
+            order: EyeOrder::LeftFirst,
+            anamorphic,
+        }
+    }
+
+    pub fn is_anaglyph(self) -> bool {
+        matches!(self, Self::Anaglyph)
+    }
+
+    /// True when a second video file supplies the other eye.
+    pub fn needs_second_file(self) -> bool {
+        matches!(self, Self::TwoFiles)
+    }
+
+    /// The size of one eye, given the source frame size.
+    pub fn eye_size(self, source: (usize, usize)) -> (usize, usize) {
+        match self {
+            // Recovery works at full frame size.
+            Self::Anaglyph => source,
+            Self::Packed {
+                packing,
+                anamorphic,
+                ..
+            } => crate::packed::eye_size(source, packing, anamorphic),
+            // Each file is already one whole eye.
+            Self::TwoFiles => source,
+        }
+    }
+}
+
 /// Everything needed to convert one movie.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConvertParams {
+    /// What the source file holds.
+    pub input: InputMode,
     /// Which anaglyph encoding the source uses.
     pub input_format: AnaglyphFormat,
+    /// The encoding written when the output layout is [`OutputLayout::Anaglyph`].
+    ///
+    /// Deliberately separate from the source's. Recovering a red/cyan transfer
+    /// and writing it back as green/magenta is a reasonable thing to want —
+    /// green/magenta glasses hold colour better — and tying the two together
+    /// would make it impossible.
+    pub output_format: AnaglyphFormat,
     /// The transfer function the decoded samples carry.
     pub transfer: TransferFunction,
     /// Convert to linear light before extraction, cross-talk and blur.
@@ -65,8 +193,13 @@ pub struct ConvertParams {
 
     /// Which eye comes from a 2D release rather than the anaglyph.
     pub mono_eye: MonoEye,
-    /// Frames to shift the 2D source by, to bring it into sync.
-    pub mono_frame_offset: i32,
+
+    /// The part of the anaglyph to convert.
+    pub anaglyph_trim: SourceTrim,
+    /// The part of the colour source that lines up with it.
+    pub colour_trim: SourceTrim,
+    /// The part of the 2D eye source that lines up with it.
+    pub mono_trim: SourceTrim,
 
     /// Exchange the two eyes before layout.
     pub swap_eyes: bool,
@@ -79,7 +212,9 @@ pub struct ConvertParams {
 impl Default for ConvertParams {
     fn default() -> Self {
         Self {
+            input: InputMode::Anaglyph,
             input_format: AnaglyphFormat::RedCyan,
+            output_format: AnaglyphFormat::RedCyan,
             transfer: TransferFunction::Srgb,
             work_in_linear_light: true,
             // The values the original post recommends as a starting point.
@@ -90,11 +225,13 @@ impl Default for ConvertParams {
             leak_correct_right: 0.0,
             defringe_left: 1.0,
             defringe_right: 1.0,
-            restore: ColourRestore::Scale,
+            restore: ColourRestore::default(),
             grade_left: Grade::default(),
             grade_right: Grade::default(),
             mono_eye: MonoEye::None,
-            mono_frame_offset: 0,
+            anaglyph_trim: SourceTrim::whole(),
+            colour_trim: SourceTrim::whole(),
+            mono_trim: SourceTrim::whole(),
             swap_eyes: false,
             layout: OutputLayout::SideBySide,
             eye_order: EyeOrder::LeftFirst,
@@ -148,6 +285,75 @@ impl ConvertParams {
         sigma_from_shrink(self.defringe_right)
     }
 
+    /// The frame to read from a secondary source when the anaglyph is at
+    /// `frame`, so that both land on the same moment.
+    pub fn aligned_frame(&self, other: &SourceTrim, frame: u64) -> u64 {
+        other.frame_at(frame.saturating_sub(self.anaglyph_trim.start))
+    }
+
+    /// The size of each recovered eye, given the source frame size.
+    pub fn eye_size(&self, source: (usize, usize)) -> (usize, usize) {
+        self.input.eye_size(source)
+    }
+
+    /// The size of the finished frame the encoder will be handed.
+    pub fn output_geometry(&self, source: (usize, usize)) -> (usize, usize) {
+        if let Some(size) = self.output_size {
+            return size;
+        }
+        let (w, h) = self.eye_size(source);
+        match self.layout {
+            OutputLayout::SideBySide => (w * 2, h),
+            OutputLayout::TopBottom => (w, h * 2),
+            OutputLayout::Separate
+            | OutputLayout::Anaglyph
+            | OutputLayout::LeftOnly
+            | OutputLayout::RightOnly => (w, h),
+        }
+    }
+
+    /// The display aspect ratio of one eye, given the source frame's shape.
+    ///
+    /// `source_display_aspect` is the shape the whole source frame is meant to
+    /// be seen at, pixel shape already accounted for.
+    pub fn eye_display_aspect(&self, source_display_aspect: f64) -> f64 {
+        match self.input {
+            // The eye is the whole frame.
+            InputMode::Anaglyph | InputMode::TwoFiles => source_display_aspect,
+            // A squeezed eye is meant to fill the frame's own shape.
+            InputMode::Packed {
+                anamorphic: true, ..
+            } => source_display_aspect,
+            // A full-resolution pair holds two frames' worth, so each eye is
+            // half as wide (or twice as tall) as the packed frame.
+            InputMode::Packed {
+                packing: StereoPacking::SideBySide,
+                ..
+            } => source_display_aspect / 2.0,
+            InputMode::Packed {
+                packing: StereoPacking::TopBottom,
+                ..
+            } => source_display_aspect * 2.0,
+        }
+    }
+
+    /// The display aspect ratio the finished frame should be seen at.
+    ///
+    /// Stacking two eyes doubles the width or the height, so the shape of the
+    /// output is not the shape of an eye. Without this the encoder assumes
+    /// square pixels and every non-square source comes out stretched.
+    pub fn output_display_aspect(&self, source_display_aspect: f64) -> f64 {
+        let eye = self.eye_display_aspect(source_display_aspect);
+        match self.layout {
+            OutputLayout::SideBySide => eye * 2.0,
+            OutputLayout::TopBottom => eye / 2.0,
+            OutputLayout::Separate
+            | OutputLayout::Anaglyph
+            | OutputLayout::LeftOnly
+            | OutputLayout::RightOnly => eye,
+        }
+    }
+
     /// Rejects settings that cannot produce a sensible result.
     pub fn validate(&self) -> Result<(), ParamsError> {
         fn range(name: &'static str, value: f32, min: f32, max: f32) -> Result<(), ParamsError> {
@@ -182,6 +388,244 @@ impl ConvertParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real transfer that exposed this: 708x276 stored with 8:9 pixels,
+    /// so it is meant to be seen at 2.28:1 rather than the 2.57:1 its stored
+    /// dimensions suggest.
+    const REAL_DAR: f64 = 472.0 / 207.0;
+
+    #[test]
+    fn an_explicit_output_size_still_shows_the_right_shape() {
+        // Resizing changes how many pixels are stored, not what the picture
+        // looks like. Asking for 1920x1080 from a 2.28:1 source gives a
+        // 1920x1080 file that still displays at 2.28:1, rather than a
+        // stretched one — a resize should never distort.
+        let p = ConvertParams {
+            output_size: Some((1920, 1080)),
+            layout: OutputLayout::LeftOnly,
+            ..Default::default()
+        };
+        assert_eq!(p.output_geometry((708, 276)), (1920, 1080));
+        assert!(
+            (p.output_display_aspect(REAL_DAR) - REAL_DAR).abs() < 1e-9,
+            "the shape must survive the resize"
+        );
+    }
+
+    #[test]
+    fn an_anaglyph_eye_keeps_the_whole_frames_shape() {
+        let p = ConvertParams::default();
+        assert!((p.eye_display_aspect(REAL_DAR) - REAL_DAR).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stacking_two_eyes_side_by_side_doubles_the_shape() {
+        let p = ConvertParams {
+            layout: OutputLayout::SideBySide,
+            ..Default::default()
+        };
+        assert!((p.output_display_aspect(REAL_DAR) - REAL_DAR * 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stacking_top_and_bottom_halves_the_shape() {
+        let p = ConvertParams {
+            layout: OutputLayout::TopBottom,
+            ..Default::default()
+        };
+        assert!((p.output_display_aspect(REAL_DAR) - REAL_DAR / 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_single_eye_output_keeps_the_eyes_shape() {
+        for layout in [
+            OutputLayout::Anaglyph,
+            OutputLayout::LeftOnly,
+            OutputLayout::RightOnly,
+            OutputLayout::Separate,
+        ] {
+            let p = ConvertParams {
+                layout,
+                ..Default::default()
+            };
+            assert!(
+                (p.output_display_aspect(REAL_DAR) - REAL_DAR).abs() < 1e-9,
+                "{layout:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_resolution_packed_eye_is_half_the_packed_shape() {
+        // A 3840x1080 frame at 32:9 holds two 16:9 eyes.
+        let p = ConvertParams {
+            input: InputMode::packed(StereoPacking::SideBySide, false),
+            ..Default::default()
+        };
+        assert!((p.eye_display_aspect(32.0 / 9.0) - 16.0 / 9.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_squeezed_packed_eye_fills_the_packed_shape() {
+        // A 1920x1080 frame at 16:9 holds two squeezed eyes, each of which is
+        // meant to be seen at 16:9 once stretched back.
+        let p = ConvertParams {
+            input: InputMode::packed(StereoPacking::SideBySide, true),
+            ..Default::default()
+        };
+        assert!((p.eye_display_aspect(16.0 / 9.0) - 16.0 / 9.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_full_resolution_top_bottom_eye_is_twice_the_packed_shape() {
+        // A 1920x2160 frame at 8:9 holds two 16:9 eyes.
+        let p = ConvertParams {
+            input: InputMode::packed(StereoPacking::TopBottom, false),
+            ..Default::default()
+        };
+        assert!((p.eye_display_aspect(8.0 / 9.0) - 16.0 / 9.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unpacking_and_repacking_returns_the_original_shape() {
+        // Take a full side-by-side pair apart and stack it again: the finished
+        // frame must be the shape it started as.
+        let p = ConvertParams {
+            input: InputMode::packed(StereoPacking::SideBySide, false),
+            layout: OutputLayout::SideBySide,
+            ..Default::default()
+        };
+        assert!((p.output_display_aspect(32.0 / 9.0) - 32.0 / 9.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_untrimmed_source_yields_every_frame() {
+        let trim = SourceTrim::whole();
+        assert!(trim.is_whole());
+        assert_eq!(trim.length(500), 500);
+        assert_eq!(trim.frame_at(0), 0);
+    }
+
+    #[test]
+    fn a_start_point_drops_the_frames_before_it() {
+        let trim = SourceTrim {
+            start: 100,
+            end: None,
+        };
+        assert_eq!(trim.length(500), 400);
+        assert_eq!(
+            trim.frame_at(0),
+            100,
+            "the first converted frame is the start"
+        );
+        assert_eq!(trim.frame_at(7), 107);
+    }
+
+    #[test]
+    fn an_end_point_is_inclusive() {
+        // It names a frame someone looked at and marked, so it is part of the
+        // range rather than one past it.
+        let trim = SourceTrim {
+            start: 10,
+            end: Some(19),
+        };
+        assert_eq!(trim.length(500), 10);
+    }
+
+    #[test]
+    fn an_end_beyond_the_file_is_clamped_to_it() {
+        let trim = SourceTrim {
+            start: 0,
+            end: Some(9_999),
+        };
+        assert_eq!(trim.length(100), 100);
+    }
+
+    #[test]
+    fn a_range_that_starts_past_the_end_yields_nothing() {
+        // A half-finished alignment should stop the render, not crash it.
+        assert_eq!(
+            SourceTrim {
+                start: 900,
+                end: None
+            }
+            .length(100),
+            0
+        );
+        assert_eq!(
+            SourceTrim {
+                start: 50,
+                end: Some(20)
+            }
+            .length(100),
+            0
+        );
+        assert_eq!(SourceTrim::whole().length(0), 0);
+    }
+
+    #[test]
+    fn a_frame_maps_into_the_trim_and_back() {
+        let trim = SourceTrim {
+            start: 60,
+            end: Some(120),
+        };
+        assert_eq!(trim.offset_of(60), Some(0));
+        assert_eq!(trim.offset_of(75), Some(15));
+        assert_eq!(trim.offset_of(59), None, "before the start");
+        assert_eq!(trim.offset_of(121), None, "past the end");
+    }
+
+    #[test]
+    fn two_sources_starting_at_different_points_align() {
+        // The whole purpose: the anaglyph begins at 100, the 2D copy shows the
+        // same moment at 340, so converting anaglyph frame 105 must read 345.
+        let params = ConvertParams {
+            anaglyph_trim: SourceTrim {
+                start: 100,
+                end: None,
+            },
+            mono_trim: SourceTrim {
+                start: 340,
+                end: None,
+            },
+            ..Default::default()
+        };
+        assert_eq!(params.aligned_frame(&params.mono_trim, 100), 340);
+        assert_eq!(params.aligned_frame(&params.mono_trim, 105), 345);
+    }
+
+    #[test]
+    fn a_source_that_needs_no_shift_maps_one_to_one() {
+        let params = ConvertParams::default();
+        assert_eq!(params.aligned_frame(&params.colour_trim, 42), 42);
+    }
+
+    #[test]
+    fn trims_survive_a_preset_round_trip() {
+        let params = ConvertParams {
+            anaglyph_trim: SourceTrim {
+                start: 120,
+                end: Some(9000),
+            },
+            mono_trim: SourceTrim {
+                start: 355,
+                end: None,
+            },
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&params).expect("serialise");
+        let back: ConvertParams = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(back, params);
+    }
+
+    #[test]
+    fn a_preset_without_trims_still_loads() {
+        // Presets written before alignment existed must keep working.
+        let back: ConvertParams =
+            serde_json::from_str(r#"{"decimate_horiz": 4.0}"#).expect("deserialise");
+        assert!(back.anaglyph_trim.is_whole());
+        assert!(back.mono_trim.is_whole());
+    }
 
     #[test]
     fn defaults_are_valid_and_do_nothing_but_recover() {
@@ -275,7 +719,10 @@ mod tests {
             input_format: AnaglyphFormat::GreenMagenta,
             leak_correct_right: 12.5,
             mono_eye: MonoEye::Left,
-            mono_frame_offset: -3,
+            mono_trim: SourceTrim {
+                start: 12,
+                end: Some(400),
+            },
             layout: OutputLayout::TopBottom,
             output_size: Some((1920, 1080)),
             ..Default::default()

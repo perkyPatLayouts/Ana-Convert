@@ -20,6 +20,44 @@ pub enum OutputLayout {
     TopBottom,
     /// Two independent streams.
     Separate,
+    /// Muxed back into an anaglyph — the reverse trip, for viewing on a plain
+    /// screen with the old glasses.
+    Anaglyph,
+    /// The left eye alone, as a flat 2D file.
+    LeftOnly,
+    /// The right eye alone.
+    RightOnly,
+}
+
+impl OutputLayout {
+    /// Every layout, in the order a menu should list them.
+    pub const ALL: [OutputLayout; 6] = [
+        Self::SideBySide,
+        Self::TopBottom,
+        Self::Separate,
+        Self::Anaglyph,
+        Self::LeftOnly,
+        Self::RightOnly,
+    ];
+
+    /// How many files this layout writes.
+    pub fn file_count(self) -> usize {
+        match self {
+            Self::Separate => 2,
+            _ => 1,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SideBySide => "Side by side",
+            Self::TopBottom => "Top and bottom",
+            Self::Separate => "Two files, one per eye",
+            Self::Anaglyph => "Anaglyph",
+            Self::LeftOnly => "Left eye only",
+            Self::RightOnly => "Right eye only",
+        }
+    }
 }
 
 /// Which eye is placed first — left or top.
@@ -174,6 +212,38 @@ fn lanczos(x: f32) -> f32 {
     LANCZOS_A * px.sin() * (px / LANCZOS_A).sin() / (px * px)
 }
 
+/// Resizes a frame to exactly `width`x`height`, doing nothing when it already
+/// matches.
+///
+/// A 2D release of the same film is very often a different resolution from the
+/// anaglyph rip — a 1080p transfer beside a 708-wide one is entirely normal —
+/// so secondary sources are brought to the anaglyph's geometry rather than
+/// being refused.
+pub fn conform_to(frame: &FrameF32, width: usize, height: usize) -> FrameF32 {
+    if frame.width() == width && frame.height() == height {
+        return frame.clone();
+    }
+    resize(frame, width, height)
+}
+
+/// Whether reshaping `from` into `to` would visibly stretch the picture.
+///
+/// Different resolutions are fine; different *shapes* are not, and usually mean
+/// the two releases are cropped differently — a 16:9 transfer beside a
+/// scope-cropped anaglyph. Worth saying so rather than silently distorting.
+pub fn aspect_differs(from: (usize, usize), to: (usize, usize)) -> bool {
+    /// Enough slack to absorb a pixel of rounding without excusing a genuinely
+    /// different crop.
+    const TOLERANCE: f32 = 0.02;
+
+    if from.0 == 0 || from.1 == 0 || to.0 == 0 || to.1 == 0 {
+        return false;
+    }
+    let a = from.0 as f32 / from.1 as f32;
+    let b = to.0 as f32 / to.1 as f32;
+    (a - b).abs() / b > TOLERANCE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +364,85 @@ mod tests {
         let out = resize(&src, 8, 1);
         let r = out.plane(0);
         assert!(r[0] < r[3] && r[3] < r[7], "must ramp across: {r:?}");
+    }
+
+    #[test]
+    fn every_layout_is_offered() {
+        // ALL drives the menu, so a layout missing from it cannot be chosen at
+        // all — which is how right-eye-only output went missing after being
+        // implemented and tested.
+        for layout in [
+            OutputLayout::SideBySide,
+            OutputLayout::TopBottom,
+            OutputLayout::Separate,
+            OutputLayout::Anaglyph,
+            OutputLayout::LeftOnly,
+            OutputLayout::RightOnly,
+        ] {
+            assert!(
+                OutputLayout::ALL.contains(&layout),
+                "{layout:?} exists but is not offered"
+            );
+        }
+    }
+
+    #[test]
+    fn conforming_to_the_same_size_changes_nothing() {
+        let src = ramp(5, 4, 0.0);
+        let out = conform_to(&src, 5, 4);
+        assert_eq!(
+            out.as_slice(),
+            src.as_slice(),
+            "should be left completely alone"
+        );
+    }
+
+    #[test]
+    fn conforming_reaches_the_requested_geometry() {
+        let out = conform_to(&FrameF32::new_rgb(1920, 1080), 708, 276);
+        assert_eq!((out.width(), out.height()), (708, 276));
+    }
+
+    #[test]
+    fn conforming_preserves_a_flat_field() {
+        let src = FrameF32::filled(1920, 64, 3, 0.42);
+        let out = conform_to(&src, 708, 30);
+        for (i, &s) in out.as_slice().iter().enumerate() {
+            assert!((s - 0.42).abs() < 1e-4, "sample {i} drifted to {s}");
+        }
+    }
+
+    #[test]
+    fn conforming_works_on_grey_frames_too() {
+        let out = conform_to(&FrameF32::new_grey(100, 50), 40, 20);
+        assert_eq!((out.width(), out.height(), out.channels()), (40, 20, 1));
+    }
+
+    #[test]
+    fn the_same_shape_at_another_size_is_not_a_distortion() {
+        // A 1080p transfer of a scope film beside a smaller rip of the same
+        // crop: different resolution, identical shape.
+        assert!(!aspect_differs((1416, 552), (708, 276)));
+        assert!(!aspect_differs((708, 276), (708, 276)));
+    }
+
+    #[test]
+    fn a_different_shape_is_flagged() {
+        // 16:9 squeezed onto a 2.56:1 crop would stretch faces sideways.
+        assert!(aspect_differs((1920, 1080), (708, 276)));
+    }
+
+    #[test]
+    fn rounding_alone_does_not_count_as_a_distortion() {
+        // 707 vs 708 is a rounding artefact, not a different crop.
+        assert!(!aspect_differs((707, 276), (708, 276)));
+    }
+
+    #[test]
+    fn an_empty_geometry_is_not_reported_as_distorted() {
+        // Nothing sensible to compare, and it must not divide by zero.
+        assert!(!aspect_differs((0, 0), (708, 276)));
+        assert!(!aspect_differs((708, 276), (0, 0)));
     }
 
     #[test]

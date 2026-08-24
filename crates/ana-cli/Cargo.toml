@@ -1,0 +1,19 @@
+[package]
+name = "ana-cli"
+description = "Headless anaglyph conversion"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ana-convert"
+path = "src/main.rs"
+
+[dependencies]
+ana-core = { path = "../ana-core" }
+ana-media = { path = "../ana-media" }
+ana-pipeline = { path = "../ana-pipeline" }
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+serde_json.workspace = true

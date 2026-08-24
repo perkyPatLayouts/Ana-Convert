@@ -1,0 +1,18 @@
+[package]
+name = "ana-pipeline"
+description = "Drives a whole anaglyph conversion: sources in, converted video out"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ana-core = { path = "../ana-core" }
+ana-media = { path = "../ana-media" }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+ana-media = { path = "../ana-media", features = ["fixtures"] }
+serde_json.workspace = true
+tempfile = "3"

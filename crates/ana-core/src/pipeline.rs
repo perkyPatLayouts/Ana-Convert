@@ -5,11 +5,13 @@
 
 use crate::blur::gaussian_blur;
 use crate::compose::{stack_horizontal, stack_vertical, EyeOrder, OutputLayout};
+use crate::extract::encode_anaglyph;
 use crate::extract::{extract_eyes, projections};
 use crate::frame::FrameF32;
 use crate::grade::apply_grade;
 use crate::leak::correct_crosstalk;
-use crate::params::{ConvertParams, MonoEye};
+use crate::packed::split_packed;
+use crate::params::{ConvertParams, InputMode, MonoEye};
 use crate::restore::restore_colour;
 use crate::transfer::{from_linear_frame, to_linear_frame};
 
@@ -23,8 +25,12 @@ pub struct StereoPair {
 /// The decoded frames feeding one conversion step.
 #[derive(Debug, Clone, Copy)]
 pub struct Sources<'a> {
-    /// The anaglyph frame. Always required.
-    pub anaglyph: &'a FrameF32,
+    /// The frame being converted. An anaglyph, a packed pair, or the left eye
+    /// of a two-file pair, depending on the input mode — hence the neutral
+    /// name, since it stopped being only an anaglyph some time ago.
+    pub primary: &'a FrameF32,
+    /// The right eye, when it comes from a second file.
+    pub right_eye: Option<&'a FrameF32>,
     /// Where colour is sampled from. Falls back to the anaglyph itself, which
     /// works but leaves the anaglyph's own colour cast in the result.
     pub colour: Option<&'a FrameF32>,
@@ -33,10 +39,11 @@ pub struct Sources<'a> {
 }
 
 impl<'a> Sources<'a> {
-    /// The common case: recover everything from the anaglyph alone.
-    pub fn from_anaglyph(anaglyph: &'a FrameF32) -> Self {
+    /// The common case: recover everything from one frame.
+    pub fn from_anaglyph(primary: &'a FrameF32) -> Self {
         Self {
-            anaglyph,
+            primary,
+            right_eye: None,
             colour: None,
             mono: None,
         }
@@ -45,12 +52,37 @@ impl<'a> Sources<'a> {
 
 /// Recovers both eyes from one anaglyph frame.
 pub fn process_frame(sources: Sources<'_>, params: &ConvertParams) -> StereoPair {
+    // A packed source needs no recovery at all — the two eyes are already
+    // there, just sharing a frame. Everything below is for anaglyph input.
+    // Two files: the pair is already in hand, one eye from each.
+    if params.input == InputMode::TwoFiles {
+        let mut pair = StereoPair {
+            left: sources.primary.clone(),
+            // Falling back to the same frame keeps the preview usable before
+            // the second file has been chosen, rather than refusing to draw.
+            right: sources.right_eye.unwrap_or(sources.primary).clone(),
+        };
+        finish_pair(&mut pair, sources, params);
+        return pair;
+    }
+
+    if let InputMode::Packed {
+        packing,
+        order,
+        anamorphic,
+    } = params.input
+    {
+        let mut pair = split_packed(sources.primary, packing, order, anamorphic);
+        finish_pair(&mut pair, sources, params);
+        return pair;
+    }
+
     let linear = params.work_in_linear_light;
     let tf = params.transfer;
 
     // 1. Bring the anaglyph and the colour reference into the working space.
-    let mut anaglyph = sources.anaglyph.clone();
-    let mut colour = sources.colour.unwrap_or(sources.anaglyph).clone();
+    let mut anaglyph = sources.primary.clone();
+    let mut colour = sources.colour.unwrap_or(sources.primary).clone();
     if linear {
         to_linear_frame(&mut anaglyph, tf);
         to_linear_frame(&mut colour, tf);
@@ -128,6 +160,23 @@ pub fn process_frame(sources: Sources<'_>, params: &ConvertParams) -> StereoPair
     StereoPair { left, right }
 }
 
+/// Grading, 2D substitution and eye swapping — the steps every input mode ends
+/// with, kept in one place so they cannot drift apart between modes.
+fn finish_pair(pair: &mut StereoPair, sources: Sources<'_>, params: &ConvertParams) {
+    apply_grade(&mut pair.left, &params.grade_left);
+    apply_grade(&mut pair.right, &params.grade_right);
+    if let Some(mono) = sources.mono {
+        match params.mono_eye {
+            MonoEye::Left => pair.left = mono.clone(),
+            MonoEye::Right => pair.right = mono.clone(),
+            MonoEye::None => {}
+        }
+    }
+    if params.swap_eyes {
+        std::mem::swap(&mut pair.left, &mut pair.right);
+    }
+}
+
 /// Packs a recovered pair into the deliverable frames.
 ///
 /// Returns one frame for a stacked layout, or two — always left then right —
@@ -144,6 +193,13 @@ pub fn compose_output(pair: &StereoPair, params: &ConvertParams) -> Vec<FrameF32
         // Ordering is carried by the output file names, so the eyes stay in
         // their natural order here.
         OutputLayout::Separate => vec![pair.left.clone(), pair.right.clone()],
+        OutputLayout::Anaglyph => vec![encode_anaglyph(
+            &pair.left,
+            &pair.right,
+            params.output_format,
+        )],
+        OutputLayout::LeftOnly => vec![pair.left.clone()],
+        OutputLayout::RightOnly => vec![pair.right.clone()],
     };
 
     match params.output_size {
@@ -197,7 +253,8 @@ mod tests {
         let colour = flat(4, 4, [0.5, 0.5, 0.5]);
         let pair = process_frame(
             Sources {
-                anaglyph: &anaglyph,
+                primary: &anaglyph,
+                right_eye: None,
                 colour: Some(&colour),
                 mono: None,
             },
@@ -221,7 +278,8 @@ mod tests {
         let colour = flat(4, 4, [0.5, 0.5, 0.5]);
         let pair = process_frame(
             Sources {
-                anaglyph: &anaglyph,
+                primary: &anaglyph,
+                right_eye: None,
                 colour: Some(&colour),
                 mono: None,
             },
@@ -258,7 +316,8 @@ mod tests {
         let anaglyph = flat(4, 4, [0.8, 0.3, 0.3]);
         let colour = flat(4, 4, [0.5, 0.5, 0.5]);
         let sources = Sources {
-            anaglyph: &anaglyph,
+            primary: &anaglyph,
+            right_eye: None,
             colour: Some(&colour),
             mono: None,
         };
@@ -281,7 +340,8 @@ mod tests {
         let mono = flat(4, 4, [0.11, 0.22, 0.33]);
         let pair = process_frame(
             Sources {
-                anaglyph: &anaglyph,
+                primary: &anaglyph,
+                right_eye: None,
                 colour: Some(&colour),
                 mono: Some(&mono),
             },
@@ -310,7 +370,8 @@ mod tests {
         let mono = flat(4, 4, [0.5, 0.5, 0.5]);
         let pair = process_frame(
             Sources {
-                anaglyph: &anaglyph,
+                primary: &anaglyph,
+                right_eye: None,
                 colour: None,
                 mono: Some(&mono),
             },
@@ -331,7 +392,8 @@ mod tests {
         let anaglyph = flat(4, 4, [0.5, 0.5, 0.5]);
         let colour = flat(4, 4, [0.5, 0.5, 0.5]);
         let sources = Sources {
-            anaglyph: &anaglyph,
+            primary: &anaglyph,
+            right_eye: None,
             colour: Some(&colour),
             mono: None,
         };
@@ -362,7 +424,8 @@ mod tests {
         let anaglyph = flat(4, 4, [0.8, 0.3, 0.3]);
         let colour = flat(4, 4, [0.5, 0.5, 0.5]);
         let sources = Sources {
-            anaglyph: &anaglyph,
+            primary: &anaglyph,
+            right_eye: None,
             colour: Some(&colour),
             mono: None,
         };
@@ -532,6 +595,379 @@ mod tests {
         assert_eq!(out.len(), 2);
         for f in &out {
             assert_eq!((f.width(), f.height()), (16, 9));
+        }
+    }
+
+    // --- packed stereo input, and the reverse trip ---
+
+    fn packed_source() -> FrameF32 {
+        // A 8x4 frame: left half bright red, right half dark blue.
+        crate::compose::stack_horizontal(&flat(4, 4, [0.9, 0.1, 0.1]), &flat(4, 4, [0.1, 0.1, 0.9]))
+    }
+
+    fn packed_params(anamorphic: bool) -> ConvertParams {
+        ConvertParams {
+            input: crate::params::InputMode::packed(
+                crate::packed::StereoPacking::SideBySide,
+                anamorphic,
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_packed_source_is_split_rather_than_recovered() {
+        // No anaglyph maths should touch it: the eyes come out exactly as
+        // stored, not colour-restored versions of themselves.
+        let pair = process_frame(
+            Sources::from_anaglyph(&packed_source()),
+            &packed_params(false),
+        );
+        assert_eq!(first_pixel(&pair.left), [0.9, 0.1, 0.1]);
+        assert_eq!(first_pixel(&pair.right), [0.1, 0.1, 0.9]);
+        assert_eq!((pair.left.width(), pair.left.height()), (4, 4));
+    }
+
+    #[test]
+    fn an_anamorphic_packed_source_comes_back_at_full_width() {
+        let pair = process_frame(
+            Sources::from_anaglyph(&packed_source()),
+            &packed_params(true),
+        );
+        assert_eq!(
+            (pair.left.width(), pair.left.height()),
+            (8, 4),
+            "each squeezed eye must be stretched back"
+        );
+    }
+
+    #[test]
+    fn a_packed_source_still_honours_grading_and_swapping() {
+        let params = ConvertParams {
+            swap_eyes: true,
+            grade_left: Grade {
+                brightness: 0.1,
+                ..Default::default()
+            },
+            ..packed_params(false)
+        };
+        let pair = process_frame(Sources::from_anaglyph(&packed_source()), &params);
+        // After the swap, the stored-first eye is on the right — and it was the
+        // one graded, because grading happens before the swap.
+        assert!(
+            (first_pixel(&pair.right)[0] - 1.0).abs() < 1e-4,
+            "0.9 plus 0.1 brightness, got {:?}",
+            first_pixel(&pair.right)
+        );
+    }
+
+    // --- two files, one per eye ---
+
+    fn two_file_params() -> ConvertParams {
+        ConvertParams {
+            input: crate::params::InputMode::TwoFiles,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn two_files_are_taken_as_the_two_eyes_untouched() {
+        // Nothing to recover and nothing to split: each file is already a whole
+        // eye, so both must arrive exactly as they were.
+        let left = flat(4, 4, [0.9, 0.1, 0.1]);
+        let right = flat(4, 4, [0.1, 0.1, 0.9]);
+        let pair = process_frame(
+            Sources {
+                primary: &left,
+                right_eye: Some(&right),
+                colour: None,
+                mono: None,
+            },
+            &two_file_params(),
+        );
+        assert_eq!(first_pixel(&pair.left), [0.9, 0.1, 0.1]);
+        assert_eq!(first_pixel(&pair.right), [0.1, 0.1, 0.9]);
+    }
+
+    #[test]
+    fn a_missing_second_file_shows_the_first_in_both_eyes() {
+        // So the preview stays usable while the second file is still being
+        // chosen, rather than refusing to draw anything.
+        let left = flat(4, 4, [0.9, 0.1, 0.1]);
+        let pair = process_frame(Sources::from_anaglyph(&left), &two_file_params());
+        assert_eq!(first_pixel(&pair.left), first_pixel(&pair.right));
+    }
+
+    #[test]
+    fn two_files_still_honour_grading_and_swapping() {
+        let left = flat(4, 4, [0.9, 0.1, 0.1]);
+        let right = flat(4, 4, [0.1, 0.1, 0.9]);
+        let params = ConvertParams {
+            swap_eyes: true,
+            ..two_file_params()
+        };
+        let pair = process_frame(
+            Sources {
+                primary: &left,
+                right_eye: Some(&right),
+                colour: None,
+                mono: None,
+            },
+            &params,
+        );
+        assert_eq!(first_pixel(&pair.left), [0.1, 0.1, 0.9], "swapped");
+    }
+
+    #[test]
+    fn two_files_reach_every_destination() {
+        let left = flat(8, 4, [0.9, 0.1, 0.1]);
+        let right = flat(8, 4, [0.1, 0.1, 0.9]);
+        for layout in OutputLayout::ALL {
+            let params = ConvertParams {
+                layout,
+                ..two_file_params()
+            };
+            let pair = process_frame(
+                Sources {
+                    primary: &left,
+                    right_eye: Some(&right),
+                    colour: None,
+                    mono: None,
+                },
+                &params,
+            );
+            let out = compose_output(&pair, &params);
+            assert_eq!(out.len(), layout.file_count(), "{layout:?}");
+            assert_eq!(
+                params.output_geometry((8, 4)),
+                (out[0].width(), out[0].height()),
+                "{layout:?} geometry"
+            );
+        }
+    }
+
+    #[test]
+    fn two_files_can_be_muxed_into_an_anaglyph() {
+        // The useful case: two per-eye files from a modern release, turned back
+        // into something the old glasses can watch.
+        let left = flat(4, 4, [0.9, 0.1, 0.1]);
+        let right = flat(4, 4, [0.1, 0.1, 0.9]);
+        let params = ConvertParams {
+            layout: OutputLayout::Anaglyph,
+            output_format: AnaglyphFormat::RedCyan,
+            ..two_file_params()
+        };
+        let pair = process_frame(
+            Sources {
+                primary: &left,
+                right_eye: Some(&right),
+                colour: None,
+                mono: None,
+            },
+            &params,
+        );
+        let out = compose_output(&pair, &params);
+        assert_eq!(
+            first_pixel(&out[0]),
+            [0.9, 0.1, 0.9],
+            "red from the left file, green and blue from the right"
+        );
+    }
+
+    #[test]
+    fn a_single_eye_can_be_pulled_from_two_files() {
+        let left = flat(4, 4, [0.9, 0.1, 0.1]);
+        let right = flat(4, 4, [0.1, 0.1, 0.9]);
+        for (layout, want) in [
+            (OutputLayout::LeftOnly, [0.9, 0.1, 0.1]),
+            (OutputLayout::RightOnly, [0.1, 0.1, 0.9]),
+        ] {
+            let params = ConvertParams {
+                layout,
+                ..two_file_params()
+            };
+            let pair = process_frame(
+                Sources {
+                    primary: &left,
+                    right_eye: Some(&right),
+                    colour: None,
+                    mono: None,
+                },
+                &params,
+            );
+            assert_eq!(
+                first_pixel(&compose_output(&pair, &params)[0]),
+                want,
+                "{layout:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_layout_survives_an_oddly_sized_packed_source() {
+        // The crash as reported: load a side-by-side file, choose anaglyph
+        // output, and the app goes down. Preview frames are scaled to whatever
+        // a pane offers, so a 601-wide frame is entirely ordinary, and an
+        // uneven split left the two eyes a column apart.
+        for (w, h) in [(601usize, 271usize), (1279, 577), (9, 5)] {
+            for packing in [
+                crate::packed::StereoPacking::SideBySide,
+                crate::packed::StereoPacking::TopBottom,
+            ] {
+                for layout in OutputLayout::ALL {
+                    let params = ConvertParams {
+                        input: crate::params::InputMode::packed(packing, false),
+                        layout,
+                        ..Default::default()
+                    };
+                    let source = FrameF32::new_rgb(w, h);
+                    let pair = process_frame(Sources::from_anaglyph(&source), &params);
+                    let out = compose_output(&pair, &params);
+                    assert_eq!(
+                        out.len(),
+                        layout.file_count(),
+                        "{w}x{h} {packing:?} {layout:?}"
+                    );
+                    assert!(
+                        out[0].width() > 0 && out[0].height() > 0,
+                        "{w}x{h} {packing:?} {layout:?} produced nothing"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_written_anaglyph_uses_the_output_format_not_the_sources() {
+        // Recovering a red/cyan transfer and writing green/magenta back out is
+        // a reasonable thing to want, so the two settings are independent.
+        // A packed source, because its two eyes are genuinely different. A
+        // flat anaglyph recovers into two near-identical eyes, and then every
+        // muxing arrangement of them coincides and the test proves nothing.
+        let params = ConvertParams {
+            output_format: AnaglyphFormat::GreenMagenta,
+            layout: OutputLayout::Anaglyph,
+            ..packed_params(false)
+        };
+        let pair = process_frame(Sources::from_anaglyph(&packed_source()), &params);
+        let out = compose_output(&pair, &params);
+
+        // Green/magenta puts the left eye in green and the right in red+blue,
+        // so the result must differ from the red/cyan mux of the same pair.
+        let as_red_cyan = ana_core_encode(&pair, AnaglyphFormat::RedCyan);
+        assert_ne!(
+            first_pixel(&out[0]),
+            first_pixel(&as_red_cyan),
+            "the output format was ignored"
+        );
+        let expected = ana_core_encode(&pair, AnaglyphFormat::GreenMagenta);
+        assert_eq!(first_pixel(&out[0]), first_pixel(&expected));
+    }
+
+    fn ana_core_encode(pair: &StereoPair, format: AnaglyphFormat) -> FrameF32 {
+        crate::extract::encode_anaglyph(&pair.left, &pair.right, format)
+    }
+
+    #[test]
+    fn every_anaglyph_output_format_is_available() {
+        let anaglyph = flat(4, 4, [0.8, 0.3, 0.3]);
+        for format in [
+            AnaglyphFormat::RedCyan,
+            AnaglyphFormat::RedBlue,
+            AnaglyphFormat::GreenMagenta,
+        ] {
+            let params = ConvertParams {
+                output_format: format,
+                layout: OutputLayout::Anaglyph,
+                ..unblurred()
+            };
+            let pair = process_frame(Sources::from_anaglyph(&anaglyph), &params);
+            let out = compose_output(&pair, &params);
+            assert_eq!(out.len(), 1, "{format:?}");
+            assert!(
+                out[0].as_slice().iter().all(|s| s.is_finite()),
+                "{format:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_packed_source_can_be_written_back_out_as_an_anaglyph() {
+        // Feature and inverse in one: side-by-side in, red/cyan out.
+        let params = ConvertParams {
+            layout: OutputLayout::Anaglyph,
+            ..packed_params(false)
+        };
+        let pair = process_frame(Sources::from_anaglyph(&packed_source()), &params);
+        let out = compose_output(&pair, &params);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].width(), out[0].height()), (4, 4));
+        assert_eq!(
+            first_pixel(&out[0]),
+            [0.9, 0.1, 0.9],
+            "red from the left eye, green and blue from the right"
+        );
+    }
+
+    #[test]
+    fn a_single_eye_can_be_extracted_from_a_packed_source() {
+        for (layout, want) in [
+            (OutputLayout::LeftOnly, [0.9, 0.1, 0.1]),
+            (OutputLayout::RightOnly, [0.1, 0.1, 0.9]),
+        ] {
+            let params = ConvertParams {
+                layout,
+                ..packed_params(false)
+            };
+            let pair = process_frame(Sources::from_anaglyph(&packed_source()), &params);
+            let out = compose_output(&pair, &params);
+            assert_eq!(out.len(), 1, "{layout:?} writes one file");
+            assert_eq!(first_pixel(&out[0]), want, "{layout:?}");
+            assert_eq!((out[0].width(), out[0].height()), (4, 4));
+        }
+    }
+
+    #[test]
+    fn a_recovered_anaglyph_can_be_written_straight_back_out_as_one() {
+        // The round trip: recover, then re-mux. Not useful in itself, but it
+        // proves the anaglyph output works from either kind of source.
+        let anaglyph = flat(4, 4, [0.8, 0.3, 0.3]);
+        let params = ConvertParams {
+            layout: OutputLayout::Anaglyph,
+            ..Default::default()
+        };
+        let pair = process_frame(Sources::from_anaglyph(&anaglyph), &params);
+        let out = compose_output(&pair, &params);
+        assert_eq!((out[0].width(), out[0].height()), (4, 4));
+        assert!(out[0].as_slice().iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn output_geometry_agrees_with_what_is_actually_produced() {
+        // The pipeline sizes encoders from this before decoding anything, so a
+        // disagreement would shear every frame.
+        let source = (8, 4);
+        for input in [
+            crate::params::InputMode::Anaglyph,
+            crate::params::InputMode::packed(crate::packed::StereoPacking::SideBySide, false),
+            crate::params::InputMode::packed(crate::packed::StereoPacking::SideBySide, true),
+            crate::params::InputMode::packed(crate::packed::StereoPacking::TopBottom, false),
+        ] {
+            for layout in OutputLayout::ALL {
+                let params = ConvertParams {
+                    input,
+                    layout,
+                    ..Default::default()
+                };
+                let pair = process_frame(Sources::from_anaglyph(&packed_source()), &params);
+                let out = compose_output(&pair, &params);
+                assert_eq!(
+                    params.output_geometry(source),
+                    (out[0].width(), out[0].height()),
+                    "{input:?} {layout:?}"
+                );
+                assert_eq!(out.len(), layout.file_count(), "{layout:?} file count");
+            }
         }
     }
 

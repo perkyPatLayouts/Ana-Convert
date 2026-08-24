@@ -15,7 +15,8 @@ pub mod decode;
 pub mod encode;
 pub mod locate;
 pub mod probe;
-mod testing;
+#[cfg(any(test, feature = "fixtures"))]
+pub mod testing;
 
 pub use decode::{grab_frame, Decoder};
 pub use encode::{EncodeSettings, Encoder, VideoCodec};

@@ -16,8 +16,16 @@
 use crate::extract::EyeProjection;
 use crate::frame::FrameF32;
 
-/// Guards the shadow divide and sets how fast the ratio method falls back to
-/// neutral grey where the colour reference has no light to scale.
+/// Keeps the [`ColourRestore::Scale`] divide finite and makes it decay towards
+/// neutral where the reference has no light left to scale.
+///
+/// Deliberately small. Raising it to eight 8-bit code values was tried against
+/// a real red/cyan film to cure speckled shadows and did not help: the
+/// amplification there comes from the ratio between this pixel's unblurred
+/// signal and a blurred neighbourhood reference, which stays large well above
+/// any floor. All the larger value bought was a 27 dB precision loss on clean
+/// sources, so it went back. The real answer to noisy shadows is
+/// [`ColourRestore::Offset`], which is the default.
 const SHADOW_FLOOR: f32 = 1e-4;
 
 /// How to reconcile the reference colour with the eye's surviving signal.
@@ -29,13 +37,25 @@ const SHADOW_FLOOR: f32 = 1e-4;
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum ColourRestore {
-    /// Multiply, preserving the reference's chromaticity exactly. Reads as
-    /// "the same colour, brighter or darker".
-    #[default]
+    /// Multiply, preserving the reference's chromaticity to within
+    /// a small shadow floor. Reads as "the same colour, brighter or darker".
+    ///
+    /// The more elegant reconstruction and the better one on clean sources,
+    /// where it scores several dB above `Offset`. It divides by the reference's
+    /// projected value, though, and a red/cyan anaglyph's shadows are exactly
+    /// where that value approaches zero — so on grainy or heavily compressed
+    /// film it breaks dark areas into cyan speckle. No choice of
+    /// shadow floor fixes that; prefer `Offset` for real footage.
     Scale,
     /// Add, preserving the reference's colour *differences* — the linear-light
-    /// descendant of the original's `MergeChroma`. Holds saturation better in
-    /// shadows and can drive channels negative in bright, saturated areas.
+    /// descendant of the original's `MergeChroma`.
+    ///
+    /// The default, because it holds up better on real footage: it never
+    /// divides, so it degrades to "keep the reference colour" when the signal
+    /// is noise, instead of amplifying it. Exact when the reference is
+    /// accurate. Can drive channels negative in bright saturated areas, which
+    /// output quantisation clamps.
+    #[default]
     Offset,
 }
 
@@ -227,6 +247,46 @@ mod tests {
         assert!(
             (scale[1] - offset[1]).abs() > 0.01,
             "modes should not coincide: {scale:?} vs {offset:?}"
+        );
+    }
+
+    /// One 8-bit code value just above black, in linear light. Real footage
+    /// quantises shadows this coarsely, so anything the guard does must be
+    /// measured against it.
+    const CODE: f32 = 1.0 / (255.0 * 12.92);
+
+    #[test]
+    fn the_default_mode_does_not_turn_a_cyan_cast_shadow_into_speckle() {
+        // Measured from the first real film this was pointed at: in its dark
+        // areas the red channel averaged 7/255 while green and blue sat at 22
+        // and 28, which is normal for red/cyan. The reference is blurred, so
+        // its red is a dark neighbourhood average while this pixel's own red is
+        // much brighter — and that gap becomes gain under a divide.
+        let reference = [2.0 * CODE, 22.0 * CODE, 28.0 * CODE];
+        let out = restore_one(30.0 * CODE, reference, rc_left(), ColourRestore::default());
+
+        let brightest = out.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(
+            brightest < 8.0 * 30.0 * CODE,
+            "a near-black reference was amplified into {out:?}"
+        );
+        assert!(
+            out[1] / out[0] < 4.0,
+            "green ran away from red: {out:?} (ratio {})",
+            out[1] / out[0]
+        );
+    }
+
+    #[test]
+    fn scale_mode_is_known_to_amplify_cyan_cast_shadows() {
+        // Documenting the weakness rather than pretending it is fixed. This is
+        // why Scale is not the default, and why anyone selecting it should be
+        // looking at a clean source.
+        let reference = [2.0 * CODE, 22.0 * CODE, 28.0 * CODE];
+        let out = restore_one(30.0 * CODE, reference, rc_left(), ColourRestore::Scale);
+        assert!(
+            out[1] / out[0] > 4.0,
+            "if Scale has become shadow-safe, make it the default again: {out:?}"
         );
     }
 

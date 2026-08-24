@@ -94,6 +94,12 @@ pub struct EncodeSettings {
     pub fps: f64,
     /// File to copy an audio track from, if any.
     pub audio_from: Option<PathBuf>,
+    /// The shape the finished frame should be seen at.
+    ///
+    /// Raw frames carry no pixel-aspect information, so without this ffmpeg
+    /// assumes square pixels and anything from a non-square source — most
+    /// disc transfers — comes out stretched. `None` means square.
+    pub display_aspect: Option<f64>,
 }
 
 impl Default for EncodeSettings {
@@ -103,6 +109,7 @@ impl Default for EncodeSettings {
             quality: 75,
             fps: 24.0,
             audio_from: None,
+            display_aspect: None,
         }
     }
 }
@@ -160,6 +167,12 @@ impl Encoder {
             ]);
         } else {
             command.args(["-map", "0:v:0"]);
+        }
+
+        if let Some(aspect) = settings.display_aspect {
+            if aspect.is_finite() && aspect > 0.0 {
+                command.args(["-aspect", &format!("{aspect:.10}")]);
+            }
         }
 
         command
@@ -376,6 +389,65 @@ mod tests {
         assert!(
             probe(&t, &out).expect("probe").has_audio,
             "audio was dropped"
+        );
+    }
+
+    #[test]
+    fn a_display_aspect_reaches_the_written_file() {
+        // The whole point: a 2:1 frame written from 128x128 pixels must be
+        // marked as 2:1, not left for a player to assume square.
+        let t = tools();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let out = dir.path().join("wide.mkv");
+
+        let mut encoder = Encoder::create(
+            &t,
+            &out,
+            128,
+            128,
+            &EncodeSettings {
+                display_aspect: Some(2.0),
+                ..settings()
+            },
+        )
+        .expect("create");
+        for _ in 0..3 {
+            encoder
+                .write_frame(&solid(128, 128, [0.5, 0.5, 0.5]))
+                .expect("write");
+        }
+        encoder.finish().expect("finish");
+
+        let info = probe(&t, &out).expect("probe");
+        assert_eq!(
+            (info.width, info.height),
+            (128, 128),
+            "stored size is unchanged"
+        );
+        assert!(
+            (info.display_aspect() - 2.0).abs() < 0.01,
+            "expected a 2:1 display shape, got {}",
+            info.display_aspect()
+        );
+    }
+
+    #[test]
+    fn no_display_aspect_leaves_square_pixels() {
+        let t = tools();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let out = dir.path().join("square.mkv");
+
+        let mut encoder = Encoder::create(&t, &out, 64, 32, &settings()).expect("create");
+        encoder
+            .write_frame(&solid(64, 32, [0.5, 0.5, 0.5]))
+            .expect("write");
+        encoder.finish().expect("finish");
+
+        let info = probe(&t, &out).expect("probe");
+        assert!(
+            (info.sample_aspect - 1.0).abs() < 1e-6,
+            "got {}",
+            info.sample_aspect
         );
     }
 
