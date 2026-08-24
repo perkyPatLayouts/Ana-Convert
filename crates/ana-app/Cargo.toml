@@ -1,0 +1,29 @@
+[package]
+name = "ana-app"
+description = "Anaglyph conversion with a live preview"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "ana_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ana-convert-app"
+path = "src/main.rs"
+
+[dependencies]
+ana-core = { path = "../ana-core" }
+ana-media = { path = "../ana-media" }
+ana-pipeline = { path = "../ana-pipeline" }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu"] }
+egui = "0.36"
+rfd = "0.17"
+serde_json.workspace = true
+
+[dev-dependencies]
+ana-media = { path = "../ana-media", features = ["fixtures"] }
+tempfile = "3"
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }

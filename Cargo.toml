@@ -5,6 +5,7 @@ members = [
     "crates/ana-media",
     "crates/ana-pipeline",
     "crates/ana-cli",
+    "crates/ana-app",
 ]
 
 [workspace.package]
