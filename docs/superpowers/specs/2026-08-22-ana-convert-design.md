@@ -1,4 +1,8 @@
-# Ana-Convert — design
+# Stereoscopic Converter — design notes
+
+Why the algorithm works the way it does, and the bugs that shaped it. For using
+the program see the [User Guide](../../USER-GUIDE.md); for working on it, see
+[Developing](../../DEVELOPING.md).
 
 Anaglyph 3D → full-colour stereo video. Apple Silicon first, portable by construction.
 
@@ -99,6 +103,136 @@ ffmpeg or media files. `frame` · `transfer` · `extract` · `leak` · `blur` ·
 - Per milestone, a real anaglyph clip rendered and viewed on the stereo display — the only test
   that catches perceptual problems.
 
+## What a real film taught us
+
+First contact with an actual release — *Comin' At Ya!* (1981), 708x276 red/cyan, no 2D version
+available — changed two decisions that every synthetic test had got wrong.
+
+**`Offset` is the default, not `Scale`.** Scale broke every dark area into cyan speckle. The cause
+is measurable: in that film's shadows the red channel averages 7/255 while green and blue sit at 22
+and 28. Scale divides by the reference's projected value — the near-zero red channel — so green and
+blue get multiplied by a large, noisy ratio and dark pixels come back as bright cyan dots. Offset
+never divides, so it degrades to "keep the reference colour" and is visibly clean.
+
+Scale still scores ~3 dB *higher* on the synthetic scene, and that is the point: synthetic PSNR was
+the wrong judge. The adversarial test scene has no grain, no compression and no cyan-cast shadows,
+so it could not see the failure that matters.
+
+**Raising `SHADOW_FLOOR` does not fix it.** The obvious theory was that the divide guard (1e-4) sat
+below 8-bit quantisation noise (one code near black is 3e-4 in linear light). Raising it to eight
+code values was tried against the film and changed nothing visible, while costing Scale 27 dB of
+precision on clean sources. It was reverted. The amplification comes from the ratio between a pixel's
+unblurred signal and a *blurred neighbourhood* reference, which stays large well above any floor.
+
+**Self-colouring cannot fix high-disparity colour, at any blur setting.** Where the two eyes are far
+apart, the anaglyph's colour at a pixel is composed from two different points in the scene. Blur
+smears that error rather than resolving it, and no value of `decimate` helped. Cross-talk correction
+does not help either — it is for ghosting, and at 30% it simply crushed the highlights to black.
+This is the limitation the original post addresses by asking for the 2D release, and it is the
+strongest argument for the mono/colour-reference path.
+
+## Aligning two releases
+
+A 2D release and the anaglyph it accompanies rarely start on the same frame, and may not run the
+same length. Every source therefore carries its own `SourceTrim { start, end }`, and the anaglyph's
+range is the timeline: it decides the output length, and the others are read in step with it.
+`end` is inclusive, because it names a frame someone looked at and marked.
+
+This replaces the old `mono_frame_offset`, which could only express a constant shift and could not
+bound the range. An offset is now just `mono_trim.start - anaglyph_trim.start`.
+
+Sources are *seeked* to their start rather than decoded and discarded — a trim beginning three
+minutes in returns in under two seconds instead of grinding through 5,850 frames. `Decoder::open()`
+delegates to `open_at()`, and `grab_frame` shares the same `apply_seek`, so "frame N" has exactly
+one definition across the preview and the render.
+
+In the app, "Align to anaglyph…" shows the two sources side by side with independent scrubbers and
+a "mark this as the start of both" button. On the command line, `--start`, `--end`, `--mono-start`
+and `--mono-end` take either a time (`3:15`) or an explicit frame (`5850f`).
+
+### The frame rate trap this uncovered
+
+Verifying a trimmed render against a pre-cut ground truth scored only 23.7 dB where identical
+frames were expected. The seek was landing **5.8 frames early**, because `probe` preferred
+ffprobe's `r_frame_rate`.
+
+For a real disc rip, `r_frame_rate` reported a round `30/1` while the file actually runs at
+29.9687. `r_frame_rate` is the *lowest rate that can represent every timestamp*, not the rate the
+film runs at. `avg_frame_rate` is frames over duration, which is exactly the frame-to-time mapping
+seeking needs. Preferring it took the same comparison to **47.1 dB** — identical bar the re-encode.
+
+The same error was quietly affecting two other things: scrubbing the preview showed a frame six
+early on that film, and encoding at 30 instead of 29.9687 would drift the audio by 0.6 seconds
+across a feature.
+
+## Working in both directions
+
+The tool is no longer anaglyph-in only. `InputMode` says what the source holds:
+
+* `Anaglyph` — recover a stereo pair, the original job.
+* `Packed { packing, order, anamorphic }` — the frame already *is* a stereo pair, side by side or
+  top and bottom, so nothing needs recovering. The two eyes are simply taken apart, and the
+  recovery settings do not apply.
+
+`anamorphic` handles the squeeze that lets a pair share one ordinary frame: a 1920x1080 file holding
+two 960x1080 eyes, each of which represents a full 1920x1080 picture. Split naively everyone comes
+out half as wide as they should be, so each eye is stretched back. Full-resolution packing (a
+3840x1080 frame holding two 1920x1080 eyes) needs no stretch, which is the default.
+
+`OutputLayout` gained three destinations to match: `Anaglyph` re-muxes a pair for the old glasses,
+and `LeftOnly` / `RightOnly` write a single eye as a flat 2D file. Combined with the input modes
+that covers the useful trips — anaglyph to stereo, stereo to anaglyph, stereo to one eye, and
+repacking side-by-side as top-and-bottom.
+
+Geometry for all of this lives in one place, `ConvertParams::output_geometry`, and a test asserts it
+agrees with what conversion actually produces for every input mode and layout. The pipeline sizes
+its encoders from that figure before decoding a single frame, so a disagreement would shear every
+frame of a render.
+
+## Pixel shape
+
+Video pixels are not always square. The real transfer used for testing stores 708x276 with an 8:9
+pixel aspect, so it is meant to be seen at 2.28:1 rather than the 2.57:1 its stored dimensions
+imply. Raw video carries no such metadata, so decoding to `rgb24` drops it and encoding from raw
+puts square pixels back — every non-square source came out stretched by 12.5%.
+
+The shape is now read at probe time (`VideoInfo::sample_aspect`) and restored at encode time via
+ffmpeg's `-aspect`. What it should be restored *to* depends on the layout, since stacking two eyes
+changes the shape of the frame:
+
+| | display aspect |
+|---|---|
+| one eye, anaglyph, or two separate files | eye shape |
+| side by side | eye shape × 2 |
+| top and bottom | eye shape ÷ 2 |
+
+and the eye's own shape depends on the input: the whole frame for an anaglyph or a squeezed
+anamorphic pair, half the frame's width for a full side-by-side pair, twice its height for a full
+top-and-bottom one. `ConvertParams::output_display_aspect` holds all of that, and the preview pane
+draws through the same figure — tuning against a stretched picture would be tuning against the
+wrong picture.
+
+An explicit output size changes how many pixels are stored, not what the picture looks like:
+rendering that 2.28:1 source at 1920x1080 gives a 1920x1080 file that still displays at 2.28:1. A
+resize should never distort.
+
+### Why this took three attempts
+
+The arithmetic was right after the first fix, and the rendered files were correct. What stayed wrong
+was the *preview*, because the pane used `centered_and_justified` — which justifies, meaning it
+stretches its child to fill the space, silently discarding the size it was handed. The picture
+reverted to its texture's own shape, which for a 1280x576 side-by-side frame is 2.22:1 rather than
+the 3.56:1 it should be seen at.
+
+Nothing in the suite could see it: the sizing function was correct and tested, and the fault lived
+in the drawing. `egui_kittest` now renders the real widget headlessly and measures the rectangle it
+paints, so the shape on screen is checked rather than the shape intended. Putting the old layout
+back fails three of those four tests immediately.
+
+One wart: ffmpeg derives the stored pixel ratio from a decimal, so an exact 8:9 source comes back as
+5612:6313 — the same shape to four decimal places, but not the same rational. Carrying the ratio
+through as integers would fix it and has not been worth the plumbing.
+
 ## Performance
 
 Measured on an M-series Mac (6 performance + 4 efficiency cores), 1080p, release build.
@@ -122,6 +256,89 @@ Two findings worth keeping:
   across rayon measured no faster and was reverted. `process_frame` touches roughly fifteen
   full-frame buffers (25 MB each at 1080p); the next real gain is fusing passes to cut allocations,
   not adding threads. Not worth doing until something demands it.
+
+## The 2D source is one thing, not two
+
+A 2D release of the same film can serve two purposes, and they are not alternatives so much as
+degrees of knowledge:
+
+* **Colour reference only** — both eyes are still recovered from the anaglyph, and the file supplies
+  only hue. This is what removes the cast, because the anaglyph's own colours are a blend of two
+  views and are wrong wherever those views disagree, which is exactly where the depth is.
+* **It *is* the left/right eye** — that eye is not recovered at all. It passes straight through,
+  perfect, and only the other eye is reconstructed, using this same file for its colour.
+
+The second is strictly better and is the best result the method can give. So the app offers one 2D
+source slot with a role rather than two slots, and when the role names an eye the file is handed to
+the renderer as both `colour` and `mono`. The CLI does the same: `--mono` implies `--colour` unless
+one is given explicitly.
+
+The role lives in the app rather than in `ConvertParams`, so it has to be folded in — and it is
+folded in for the preview and the render through one `effective_params()`, because the alternative
+is the two quietly disagreeing about what they are showing. That has happened enough times already.
+
+## Three ways in, six ways out
+
+`InputMode` says what the source holds — an anaglyph to recover, a packed pair to
+split, or two files that are already the eyes — and `OutputLayout` says what to
+write. Every combination works, including repacking side-by-side as
+top-and-bottom, and muxing a modern per-eye pair back into something the old
+glasses can watch.
+
+All three input modes end with the same steps: grade, substitute a 2D eye if one
+was given, swap if asked. Those live in one `finish_pair` rather than being
+written out three times, because three copies is how they drift apart.
+
+Adding the third mode is also what forced `Sources.anaglyph` to be renamed
+`primary`. It had stopped being only an anaglyph when packed sources arrived; a
+third meaning would have made it actively misleading.
+
+### A menu constant that hid a finished feature
+
+`OutputLayout::ALL` drives the destination menu, and it listed five of the six
+layouts. Right-eye-only output was implemented, tested and reachable from the
+command line, and simply could not be chosen in the app. There is now a test
+asserting that every layout which exists appears in `ALL` — the sort of thing
+that feels redundant right up until it is not.
+
+## The theme that never applied
+
+The app looked washed out, and the reason was not the palette. `set_visuals`
+dresses only the theme currently in use; on a Mac set to Light the app fell back
+to egui's default light palette, and section headings tuned as light cyan for a
+dark background landed on near-white.
+
+It now pins the preference to Dark *and* sets visuals for both themes, so there
+is nothing to fall back to. Dark is also simply correct here: a picture being
+judged wants a neutral dark surround, which is why every video tool has one.
+
+egui's default text sizes are small for a desktop app read at arm's length —
+body and button at 13px, and the "small" style used for every note and warning
+at **9px**. All raised.
+
+## The Mac app
+
+`python3 packaging/build-app.py --verify` produces `target/Ana-Convert.app` — 49 MB, Apple Silicon.
+
+The app carries its own ffmpeg. A copy that only runs where Homebrew happens to be installed is not
+an app, it is a development setup, so `ffmpeg`, `ffprobe` and the nineteen libraries they reach are
+copied into the bundle and their install names rewritten to point inside it. `locate()` already
+preferred a copy sitting beside the executable, which is exactly where they land.
+
+Signing comes last, because rewriting install names invalidates a signature, and nested code has to
+be signed before the bundle containing it.
+
+`--verify` proves the claim rather than asserting it: it checks the signature, runs the bundled
+ffmpeg with an emptied `PATH`, and fails if any library still refers to `/opt` or `/usr/local`.
+`ana-convert-app --check` reports which tools the app resolved and whether they run — worth having
+because "it does nothing" and "it cannot find its tools" look identical from outside a bundle.
+
+The icon is drawn by `packaging/make-icon.py` rather than checked in, so there is no binary asset to
+lose and the design can be read.
+
+Signing is ad-hoc. Real distribution needs an Apple Developer ID, `--options runtime`, and
+submission to Apple's notary service; without that, Gatekeeper will quarantine the app on any
+machine it did not come from.
 
 ## Not in v1
 
