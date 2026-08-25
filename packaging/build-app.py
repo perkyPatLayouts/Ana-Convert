@@ -10,9 +10,12 @@ Run from the repository root:
 
     python3 packaging/build-app.py            # build and sign
     python3 packaging/build-app.py --verify   # also check it runs with an empty PATH
+    python3 packaging/build-app.py --dmg      # also package it for download
 """
 import argparse
+import hashlib
 import os
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -79,6 +82,7 @@ def rewrite(binary: Path, closure: dict[str, Path], rpath: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--verify", action="store_true", help="check self-containment")
+    parser.add_argument("--dmg", action="store_true", help="package for download")
     parser.add_argument("--sign", default="-", help="signing identity, default ad-hoc")
     args = parser.parse_args()
 
@@ -131,6 +135,14 @@ def main():
     for tool in tools:
         rewrite(tool, closure, "@executable_path/../Frameworks")
 
+    # Homebrew installs its libraries read-only and copy2 preserves that, which
+    # leaves files nobody can remove an extended attribute from — and clearing
+    # com.apple.quarantine is exactly what someone who downloads this has to do.
+    # Restore the owner's write bit before signing.
+    for path in APP.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            path.chmod(path.stat().st_mode | 0o200)
+
     # Signing must come last: rewriting install names invalidates a signature,
     # and nested code has to be signed before the bundle that contains it.
     print(f"signing (identity {args.sign!r})…")
@@ -143,6 +155,70 @@ def main():
 
     if args.verify:
         verify(macos)
+    if args.dmg:
+        build_dmg()
+
+
+def build_dmg():
+    """Packages the bundle as a DMG laid out for drag-to-install.
+
+    The version comes from the Info.plist that actually shipped rather than from
+    Cargo.toml, so the file name cannot disagree with what the app reports about
+    itself.
+    """
+    print("\npackaging…")
+    plist = plistlib.loads((APP / "Contents" / "Info.plist").read_bytes())
+    version = plist["CFBundleShortVersionString"]
+    dmg = ROOT / "target" / f"StereoscopicConverter-{version}.dmg"
+
+    staging = ROOT / "target" / "dmg-staging"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    # ditto rather than copytree: it is the only copy on macOS that reliably
+    # preserves the bundle bit-for-bit, and a disturbed bundle is an invalid
+    # signature.
+    run(["ditto", str(APP), str(staging / APP.name)])
+    (staging / "Applications").symlink_to("/Applications")
+
+    if dmg.exists():
+        dmg.unlink()
+    run([
+        "hdiutil", "create",
+        "-volname", "Stereoscopic Converter",
+        "-srcfolder", str(staging),
+        "-ov", "-format", "UDZO",
+        "-quiet",
+        str(dmg),
+    ])
+    shutil.rmtree(staging)
+
+    verify_dmg(dmg)
+
+    digest = hashlib.sha256(dmg.read_bytes()).hexdigest()
+    print(f"\n{dmg}  ({dmg.stat().st_size / 1024 / 1024:.0f} MB)")
+    print("\nfor packaging/stereoscopic-converter.rb:")
+    print(f'  version "{version}"')
+    print(f'  sha256 "{digest}"')
+
+
+def verify_dmg(dmg: Path):
+    """Checks the signature on the copy inside the image, not the one built.
+
+    Packaging is where a signature gets broken, so verifying the source bundle
+    would prove nothing about what a user downloads.
+    """
+    out = run(["hdiutil", "attach", str(dmg), "-nobrowse", "-readonly", "-plist"])
+    mount = next(
+        entity["mount-point"]
+        for entity in plistlib.loads(out.encode())["system-entities"]
+        if "mount-point" in entity
+    )
+    try:
+        run(["codesign", "--verify", "--strict", str(Path(mount) / APP.name)])
+        print("  signature intact inside the image")
+    finally:
+        subprocess.run(["hdiutil", "detach", mount, "-quiet"], capture_output=True)
 
 
 def verify(macos: Path):

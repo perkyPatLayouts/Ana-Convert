@@ -30,16 +30,30 @@ Audio is stream-copied from the source, never re-encoded.
 
 ## Getting it
 
+Apple Silicon, macOS 11 or newer. The app carries its own ffmpeg — 49 MB,
+nothing else to install.
+
+```bash
+brew install --cask --no-quarantine perkypatlayouts/tap/stereoscopic-converter
+```
+
+Or take the disk image from [Releases](https://github.com/perkyPatLayouts/Ana-Convert/releases).
+The app is ad-hoc signed rather than notarised through the Apple Developer
+Program, so macOS will claim a downloaded copy is damaged until its quarantine
+flag is cleared. [Download and install](docs/DOWNLOAD.md) explains what that
+means and what to run — worth reading before deciding to trust the download.
+
+Building it yourself avoids the question entirely, since a local build is never
+quarantined:
+
 ```bash
 python3 packaging/build-app.py --verify
 open "target/Stereoscopic Converter.app"
 ```
 
-The app carries its own ffmpeg — 49 MB, nothing to install. `--verify` proves it,
-by checking the signature and running the bundled ffmpeg with `PATH` emptied.
-
-Building needs Rust and, for the bundling step only, a Homebrew ffmpeg to copy
-from (`brew install ffmpeg`).
+That needs Rust and, for the bundling step only, a Homebrew ffmpeg to copy from
+(`brew install ffmpeg`). `--verify` checks the signature and runs the bundled
+ffmpeg with `PATH` emptied, proving the app depends on nothing outside itself.
 
 ## Using it
 
@@ -85,6 +99,7 @@ Interlaced output is not supported.
 
 ## Documentation
 
+- **[Download and install](docs/DOWNLOAD.md)** — Homebrew, the disk image, and the Gatekeeper warning
 - **[User Guide](docs/USER-GUIDE.md)** — the workflow, every control, and how to tune
 - **[CLI reference](docs/CLI.md)** — commands, flags, worked examples
 - **[Developing](docs/DEVELOPING.md)** — architecture, building, testing, packaging

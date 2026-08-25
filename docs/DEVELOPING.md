@@ -6,7 +6,7 @@ Rust workspace, five crates, no build script and no code generation.
 cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
-python3 packaging/build-app.py --verify
+python3 packaging/build-app.py --verify --dmg
 ```
 
 `ffmpeg` on `PATH` is required: most of the media tests generate their own
@@ -142,10 +142,32 @@ and fails if any library still refers to `/opt` or `/usr/local`.
 The icon is drawn by `packaging/make-icon.py` rather than checked in, so there
 is no binary asset to lose and the design can be read.
 
-Signing is **ad-hoc**. Distribution needs an Apple Developer ID, `--options
-runtime` and Apple's notary service; without that Gatekeeper quarantines the app
-on any machine it did not come from. `--sign "Developer ID Application: …"`
-takes an identity when you have one.
+Signing is **ad-hoc**, which on Apple Silicon is not optional — an unsigned
+binary will not execute at all — but carries no developer identity, so
+Gatekeeper rejects a downloaded copy. `--sign "Developer ID Application: …"`
+takes a real identity if you ever have one; notarising on top of that also needs
+`--options runtime` and a secure timestamp, neither of which is set here.
+[Download and install](DOWNLOAD.md) is how the app is distributed without one.
+
+## Packaging for download
+
+`build-app.py --dmg` writes `target/StereoscopicConverter-<version>.dmg` with an
+`/Applications` symlink beside the app, then prints the version and sha256 to
+paste into `packaging/stereoscopic-converter.rb`. The version is read from the
+`Info.plist` that shipped rather than from `Cargo.toml`, so the file name cannot
+disagree with what the app reports about itself.
+
+It verifies the signature on the copy *inside* the mounted image. Packaging is
+where a signature gets broken, so verifying the bundle it was made from would
+prove nothing about what anyone downloads.
+
+One trap is worth knowing about. Homebrew installs its libraries read-only and
+`shutil.copy2` preserves the mode, so the vendored dylibs arrive with no owner
+write bit — and clearing an extended attribute requires write permission. Since
+everyone who downloads an unnotarised app has to run `xattr -dr
+com.apple.quarantine` on it, that produced a Permission denied for every nested
+binary. The bundler now restores the write bit before signing.
+
 
 ---
 
