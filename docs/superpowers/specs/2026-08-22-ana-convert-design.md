@@ -31,6 +31,7 @@ and an optional 2D mono frame `M`:
    - red/cyan: left `R`, right `G` (blue skipped; the original found it noisy)
    - green/magenta: left `G`, right `0.746·R + 0.254·B`
    - red/blue: left `R`, right `B`
+   - ColorCode: left `0.229·R + 0.771·G`, right `B`
 
    Weights always sum to 1, so a neutral grey of value `v` projects to `v`.
 3. **Cross-talk correction** — `L -= k_L·R`, clamp, rescale by `1/(1-k_L)`; then the same for `R`
@@ -316,6 +317,32 @@ egui's default text sizes are small for a desktop app read at arm's length —
 body and button at 13px, and the "small" style used for every note and warning
 at **9px**. All raised.
 
+## ColorCode, and why it needed its own format
+
+The original post listed ColorCode 3-D as unimplemented and "brutal". It is not brutal so much as
+lopsided, and the lopsidedness is the point.
+
+ColorCode is amber and blue. An amber filter passes red *and* green, so the left eye's projection is
+a luminance-weighted mix of the two — `0.229·R + 0.771·G`, renormalised like magenta's — rather
+than red alone as in red/blue. The right eye gets blue by itself. The *encodings* of red/blue and
+ColorCode coincide; the extractions do not, and extraction is what recovery depends on.
+
+Amber carries 93% of white's luminance and blue about 7%, so one eye arrives nearly complete and the
+other supplies little more than parallax. On the synthetic scene the amber eye recovers to 27.3 dB
+and the blue eye to 16.1. With a perfect unblurred reference it reaches 144 dB, which says the
+projection is exact and everything below that is the format rather than the arithmetic.
+
+The ground-truth test therefore asserts the *gap* between the eyes as well as the quality. The gap
+is what characterises the format; if it ever narrowed, something would be wrong with the amber
+projection.
+
+One practical consequence: a 2D release used as the **right** eye replaces the weak one outright,
+which matters more here than in any other encoding.
+
+`AnaglyphFormat` now owns `ALL` and `label()`. The app previously kept its own list of three
+formats — exactly the arrangement that had already let right-eye-only output go missing from the
+destination menu — so a fourth would have compiled cleanly and silently failed to appear.
+
 ## The Mac app
 
 `python3 packaging/build-app.py --verify` produces `target/Ana-Convert.app` — 49 MB, Apple Silicon.
@@ -342,5 +369,5 @@ machine it did not come from.
 
 ## Not in v1
 
-ColorCode anaglyph, interlaced output, GPU compute, batch queues, a legacy `.avs` parameter
-importer, disparity-aware colour warping, Linux/Windows builds.
+Interlaced output, GPU compute, batch queues, a legacy `.avs` parameter importer,
+disparity-aware colour warping, Linux/Windows builds.

@@ -3,7 +3,7 @@
 Rust workspace, five crates, no build script and no code generation.
 
 ```bash
-cargo test --workspace          # 368 tests
+cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 python3 packaging/build-app.py --verify
@@ -18,13 +18,15 @@ fixtures with it, and the bundling step copies it into the app.
 
 ```
 crates/
-├── ana-core/      5,000 lines   the conversion itself. No I/O, no processes
-├── ana-media/     1,900         ffmpeg discovery, probing, decode and encode
-├── ana-pipeline/    990         a whole file: sources in, converted video out
-├── ana-cli/         670         the ana-convert binary
-└── ana-app/       2,900         the window
-packaging/                       icon, Info.plist, bundler
+├── ana-core/      the conversion itself. No I/O, no processes
+├── ana-media/     ffmpeg discovery, probing, decode and encode
+├── ana-pipeline/  a whole file: sources in, converted video out
+├── ana-cli/       the ana-convert binary
+└── ana-app/       the window
+packaging/         icon, Info.plist, bundler
 ```
+
+Roughly 12,800 lines, half of them tests.
 
 Dependencies run one way: `core → media → pipeline → {cli, app}`.
 
@@ -37,7 +39,7 @@ so the whole algorithm can be tested without ffmpeg or a single media file.
 |---|---|
 | `frame` | `FrameF32`, planar float RGB, and 8/16-bit conversion |
 | `transfer` | sRGB and BT.709 curves, sign-preserving |
-| `extract` | Anaglyph → per-eye signal, and the inverse |
+| `extract` | Anaglyph → per-eye signal, and the inverse. Owns `AnaglyphFormat` |
 | `leak` | Cross-talk correction |
 | `blur` | Separable blur: exact Gaussian small, three box passes large |
 | `restore` | Recombining eye brightness with reference colour |
@@ -86,6 +88,11 @@ derives an anaglyph from it, recovers it, and scores the result against the
 original. Real anaglyph releases have no surviving full-colour master, so this
 is the only way to know whether recovery is right rather than merely plausible.
 It found two real algorithm errors.
+
+Some of its assertions are about *relationships* rather than absolute numbers —
+that ColorCode's amber eye beats its blue eye by a wide margin, say. Those
+survive tuning in a way that a bare threshold does not, and they fail for the
+right reason when something breaks.
 
 **Headless UI.** `ana-app/tests/preview_shape.rs` renders the real widget with
 `egui_kittest` and measures the rectangle it paints. Three aspect-ratio faults
@@ -162,4 +169,20 @@ one option among five.
 - Assertions carry messages with the actual values. A bare `assert!(x < y)` at
   three in the morning is worth very little.
 - British spelling in prose and identifiers (`colour`), except where an external
-  API forces otherwise.
+  API forces otherwise — or where the word is a trade name, as in `ColorCode`.
+
+## Adding an anaglyph encoding
+
+`AnaglyphFormat` owns its variants, `ALL` and `label()`, so a new one appears in
+every menu and every format loop without touching the app or the CLI. What it
+needs is a projection in `projections()` — the linear combination of RGB each
+filter passes, with weights summing to one — and an arm in `encode_anaglyph`.
+
+Add it to `ALL` as well. `label()`, `projections()` and `encode_anaglyph` are
+exhaustive matches, so the compiler will stop you there, but `ALL` is a
+hand-written array and nothing forces a new variant into it — and a format
+missing from `ALL` is a format no menu ever shows. `every_format_is_offered_and_named`
+guards the list against losing an entry; it cannot know about a variant nobody
+added to it. `OutputLayout` carries the same pair, for the same reason:
+right-eye-only output was fully implemented and tested but unreachable for
+exactly this reason.

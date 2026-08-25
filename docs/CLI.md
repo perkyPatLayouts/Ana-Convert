@@ -69,7 +69,7 @@ eye is also the best colour reference for the other.
 |---|---|
 | `-o, --out <FILE>` | Output. With `--layout separate`, the stem for `-left` and `-right` |
 | `--layout <KIND>` | `sbs` (default), `tb`, `separate`, `anaglyph`, `left`, `right` |
-| `--output-format <MODE>` | Anaglyph encoding to write. Independent of `--format` |
+| `--output-format <MODE>` | Anaglyph encoding to write: `red-cyan`, `green-magenta`, `red-blue`, `color-code`. Independent of `--format` |
 | `--eye-order <ORDER>` | `left-first` (default) or `right-first` |
 | `--swap-eyes` | Exchange the eyes before layout |
 | `--size <WxH>` | Resize the finished frame. Never distorts: the display shape is preserved |
