@@ -85,7 +85,13 @@ pub fn split_packed(
 }
 
 /// Lifts a rectangle out of a frame.
-fn crop(frame: &FrameF32, x0: usize, y0: usize, width: usize, height: usize) -> FrameF32 {
+pub(crate) fn crop(
+    frame: &FrameF32,
+    x0: usize,
+    y0: usize,
+    width: usize,
+    height: usize,
+) -> FrameF32 {
     let (w, channels) = (frame.width(), frame.channels());
     let mut out = FrameF32::filled(width, height, channels, 0.0);
     for c in 0..channels {

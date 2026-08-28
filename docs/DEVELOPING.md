@@ -44,7 +44,7 @@ so the whole algorithm can be tested without ffmpeg or a single media file.
 | `blur` | Separable blur: exact Gaussian small, three box passes large |
 | `restore` | Recombining eye brightness with reference colour |
 | `grade` | Per-eye brightness, contrast, saturation |
-| `compose` | Stacking, Lanczos resize, conforming, aspect comparison |
+| `compose` | Stacking, Lanczos resize, conforming, aspect comparison, convergence |
 | `packed` | Splitting side-by-side and top-and-bottom, with anamorphic |
 | `params` | `ConvertParams`, trims, geometry and aspect arithmetic |
 | `timecode` | Frames ↔ times |
@@ -142,6 +142,14 @@ and fails if any library still refers to `/opt` or `/usr/local`.
 The icon is drawn by `packaging/make-icon.py` rather than checked in, so there
 is no binary asset to lose and the design can be read.
 
+The figures in the user guide are generated the same way, by
+`docs/make-figures.py`, which builds a synthetic stereo scene and runs the real
+converter over it. A figure therefore cannot claim something the code does not
+do, and the honest artefacts show up too — the recovery figure has the halo that
+high disparity always leaves without a 2D reference. Regenerate after any change
+that alters what output looks like. The PNGs are committed because GitHub has to
+serve them; the script is what defines them.
+
 Signing is **ad-hoc**, which on Apple Silicon is not optional — an unsigned
 binary will not execute at all — but carries no developer identity, so
 Gatekeeper rejects a downloaded copy. `--sign "Developer ID Application: …"`
@@ -192,6 +200,19 @@ one option among five.
   three in the morning is worth very little.
 - British spelling in prose and identifiers (`colour`), except where an external
   API forces otherwise — or where the word is a trade name, as in `ColorCode`.
+
+## Where a new control goes
+
+`ana-app` draws its settings panel from `visible_sections()`, a list rather than
+a stack of conditionals, so which controls a given source can reach is something
+a test asserts. Convergence was written, tested and shipped inside the recovery
+section — which only anaglyph sources draw — so it worked for every input mode
+while being reachable from one. Right-eye-only output was lost the same way,
+missing from `OutputLayout::ALL`. Both faults were invisible to a suite that
+tested only the engine.
+
+A control that applies to every source belongs in the unconditional part of that
+list, and the test that says so belongs with it.
 
 ## Adding an anaglyph encoding
 

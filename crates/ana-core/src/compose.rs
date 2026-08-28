@@ -4,6 +4,7 @@
 //! Assembling the two recovered eyes into a deliverable, and resampling.
 
 use crate::frame::FrameF32;
+use crate::packed::crop;
 
 /// Lanczos `a` parameter. Three lobes is the usual quality/ringing compromise.
 const LANCZOS_A: f32 = 3.0;
@@ -68,6 +69,59 @@ pub enum EyeOrder {
     #[default]
     LeftFirst,
     RightFirst,
+}
+
+/// The narrowest frame convergence is allowed to leave.
+const MIN_CONVERGED_WIDTH: usize = 2;
+
+/// How far each eye moves, in pixels, for a given convergence percentage.
+///
+/// The percentage names the *total* separation between the eyes, so each eye
+/// moves half of it. Clamped so the overlap can never collapse.
+fn convergence_shift(width: usize, percent: f32) -> usize {
+    if !percent.is_finite() || percent == 0.0 || width <= MIN_CONVERGED_WIDTH {
+        return 0;
+    }
+    let shift = (percent.abs() as f64 / 100.0 * width as f64 / 2.0).round() as usize;
+    shift.min((width - MIN_CONVERGED_WIDTH) / 2)
+}
+
+/// The width a frame will have once converged.
+///
+/// Geometry is predicted from this rather than from the percentage, so the
+/// shape the encoder is told to expect cannot disagree with the pixels it is
+/// handed.
+pub fn converged_width(width: usize, percent: f32) -> usize {
+    width - 2 * convergence_shift(width, percent)
+}
+
+/// Shifts the eyes horizontally against each other and keeps what both cover.
+///
+/// Positive moves the eyes apart, pushing the scene behind the screen; negative
+/// brings them together and the scene forward, which is how the plane of zero
+/// parallax — the ground plane — gets placed where the viewer wants it.
+///
+/// This is pixel selection, not resampling: each eye is cropped at a different
+/// offset, so nothing is interpolated and no sharpness is lost. The frame gives
+/// up exactly the percentage asked for, which is why the number is worth
+/// showing in pixels too.
+pub fn converge(left: &FrameF32, right: &FrameF32, percent: f32) -> (FrameF32, FrameF32) {
+    let width = left.width().min(right.width());
+    let shift = convergence_shift(width, percent);
+    if shift == 0 {
+        return (left.clone(), right.clone());
+    }
+    let kept = width - 2 * shift;
+    // The eye that moves left keeps its right-hand part, and vice versa.
+    let (left_x0, right_x0) = if percent > 0.0 {
+        (2 * shift, 0)
+    } else {
+        (0, 2 * shift)
+    };
+    (
+        crop(left, left_x0, 0, kept, left.height()),
+        crop(right, right_x0, 0, kept, right.height()),
+    )
 }
 
 /// Places `a` to the left of `b`.
@@ -247,6 +301,98 @@ pub fn aspect_differs(from: (usize, usize), to: (usize, usize)) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame with one bright column, for measuring where a feature lands.
+    fn marked(width: usize, at: usize) -> FrameF32 {
+        let mut frame = FrameF32::filled(width, 1, 3, 0.0);
+        for c in 0..3 {
+            frame.plane_mut(c)[at] = 1.0;
+        }
+        frame
+    }
+
+    fn mark_position(frame: &FrameF32) -> usize {
+        frame
+            .plane(0)
+            .iter()
+            .position(|&v| v > 0.5)
+            .expect("the mark should survive the crop")
+    }
+
+    #[test]
+    fn zero_convergence_leaves_both_eyes_untouched() {
+        let (left, right) = (ramp(8, 4, 0.0), ramp(8, 4, 1.0));
+        let (l, r) = converge(&left, &right, 0.0);
+        assert_eq!(l.as_slice(), left.as_slice());
+        assert_eq!(r.as_slice(), right.as_slice());
+    }
+
+    #[test]
+    fn positive_convergence_moves_the_eyes_apart() {
+        // A feature at the same place in both eyes sits on the screen plane.
+        // Moving the eyes apart should push it behind, giving it positive
+        // parallax equal to the width given up.
+        let (l, r) = converge(&marked(100, 50), &marked(100, 50), 4.0);
+        let disparity = mark_position(&r) as i64 - mark_position(&l) as i64;
+        assert_eq!(disparity, 4, "expected the eyes to separate by 4% of 100px");
+    }
+
+    #[test]
+    fn negative_convergence_moves_the_eyes_together() {
+        let (l, r) = converge(&marked(100, 50), &marked(100, 50), -4.0);
+        let disparity = mark_position(&r) as i64 - mark_position(&l) as i64;
+        assert_eq!(
+            disparity, -4,
+            "expected the eyes to converge by 4% of 100px"
+        );
+    }
+
+    #[test]
+    fn convergence_moves_the_zero_parallax_plane_onto_a_chosen_object() {
+        // The point of the control: an object sitting 4px behind the screen is
+        // brought onto it, which is how the ground plane gets placed.
+        let (l, r) = converge(&marked(100, 50), &marked(100, 54), -4.0);
+        assert_eq!(
+            mark_position(&l),
+            mark_position(&r),
+            "the object should now have zero parallax"
+        );
+    }
+
+    #[test]
+    fn convergence_narrows_the_frame_by_its_own_percentage() {
+        let (l, r) = converge(&ramp(100, 4, 0.0), &ramp(100, 4, 1.0), 4.0);
+        assert_eq!((l.width(), l.height()), (96, 4));
+        assert_eq!((r.width(), r.height()), (96, 4));
+    }
+
+    #[test]
+    fn negative_and_positive_convergence_cost_the_same_width() {
+        let (a, _) = converge(&ramp(100, 4, 0.0), &ramp(100, 4, 1.0), 4.0);
+        let (b, _) = converge(&ramp(100, 4, 0.0), &ramp(100, 4, 1.0), -4.0);
+        assert_eq!(a.width(), b.width(), "sign should not change the crop");
+    }
+
+    #[test]
+    fn convergence_is_clamped_to_leave_a_usable_frame() {
+        // Nothing should be able to ask for a frame of zero width.
+        let (l, _) = converge(&ramp(20, 2, 0.0), &ramp(20, 2, 1.0), 100.0);
+        assert!(l.width() >= 2, "got a {}px frame", l.width());
+    }
+
+    #[test]
+    fn converged_width_agrees_with_what_convergence_produces() {
+        // The geometry arithmetic and the pixels must not drift apart: the
+        // output shape is predicted before a frame is ever converted.
+        for percent in [0.0, 1.0, -1.0, 3.7, -9.9, 10.0] {
+            let (l, _) = converge(&ramp(1920, 2, 0.0), &ramp(1920, 2, 1.0), percent);
+            assert_eq!(
+                l.width(),
+                converged_width(1920, percent),
+                "prediction disagreed at {percent}%"
+            );
+        }
+    }
 
     fn ramp(w: usize, h: usize, offset: f32) -> FrameF32 {
         let data: Vec<f32> = (0..w * h * 3).map(|i| i as f32 / 100.0 + offset).collect();

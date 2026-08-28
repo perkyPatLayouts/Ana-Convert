@@ -171,6 +171,14 @@ struct RenderArgs {
     #[arg(long, value_name = "PERCENT", allow_negative_numbers = true)]
     leak_right: Option<f32>,
 
+    /// Horizontal convergence, as a percentage of frame width.
+    ///
+    /// Positive pushes the scene behind the screen, negative brings it
+    /// forward. The output narrows by this percentage, since only what both
+    /// eyes cover can be kept.
+    #[arg(long, value_name = "PERCENT", allow_negative_numbers = true)]
+    convergence: Option<f32>,
+
     /// Video encoder.
     #[arg(long, value_enum, default_value_t = CodecArg::H264Hw)]
     codec: CodecArg,
@@ -363,7 +371,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 println!(
                     "    as {:<14} {w}x{h} displaying {:.4}:1",
                     layout.label(),
-                    p.output_display_aspect(info.display_aspect())
+                    p.output_display_aspect(info.display_aspect(), (info.width, info.height))
                 );
             }
             println!(
@@ -527,6 +535,9 @@ fn build_params(args: &RenderArgs, fps: f64) -> Result<ConvertParams, String> {
     }
     if let Some(v) = args.leak_right {
         params.leak_correct_right = v;
+    }
+    if let Some(v) = args.convergence {
+        params.convergence = v;
     }
     if args.mono_eye != MonoEyeArg::None {
         params.mono_eye = args.mono_eye.into();

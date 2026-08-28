@@ -218,10 +218,10 @@ pub fn render(
             audio_from: job.audio.clone(),
             // Carry the source's pixel shape through, or every non-square
             // transfer comes out stretched.
-            display_aspect: Some(
-                job.params
-                    .output_display_aspect(anaglyph_info.display_aspect()),
-            ),
+            display_aspect: Some(job.params.output_display_aspect(
+                anaglyph_info.display_aspect(),
+                (anaglyph_info.width, anaglyph_info.height),
+            )),
             ..job.encode.clone()
         };
         encoders.push(Encoder::create(tools, path, out_w, out_h, &settings)?);

@@ -367,6 +367,31 @@ Signing is ad-hoc. Real distribution needs an Apple Developer ID, `--options run
 submission to Apple's notary service; without that, Gatekeeper will quarantine the app on any
 machine it did not come from.
 
+## Convergence
+
+Recovery gets the geometry the master had, which is not always the geometry
+anyone should watch. Convergence shifts the eyes horizontally against each
+other, which moves every object's parallax by the same amount and so relocates
+the plane of zero parallax — the depth the viewer reads as the screen.
+
+It reduces to two crops at different offsets: the eye that moves left keeps its
+right-hand part, and vice versa. Nothing is resampled, so it costs no sharpness,
+and both eyes stay identically sized. The percentage names the total separation,
+which makes it also exactly the width given up, since only the overlap can be
+kept.
+
+It runs at the end of `finish_pair`, after the eye swap — so "right eye" means
+the one the viewer's right eye sees rather than whichever the file held — and
+before layout, so one insertion covers every input mode and every output.
+
+Two things had to be got right. The display aspect must narrow with the crop or
+every output stretches, so it is derived from the same integer widths as the
+geometry rather than recomputed from the percentage. And the anaglyph path did
+not call `finish_pair` at all: it repeated grading, substitution and swapping
+inline, so the first implementation converged every input mode except the
+commonest one. A test through the public entry point caught it; a test of the
+helper had passed.
+
 ## Not in v1
 
 Interlaced output, GPU compute, batch queues, a legacy `.avs` parameter importer,

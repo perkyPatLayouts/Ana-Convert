@@ -98,6 +98,7 @@ discarded, so starting an hour in costs nothing.
 | `--decimate-horiz <PERCENT>` | Horizontal colour blur. Lower blurs harder. Default 5 |
 | `--decimate-vert <PERCENT>` | Vertical colour blur. Default 20 |
 | `--leak-left`, `--leak-right <PERCENT>` | Cross-talk correction, `-100`..`100` |
+| `--convergence <PERCENT>` | Horizontal convergence, `-10`..`10`. Narrows the output by the same percentage |
 | `--preset <FILE>` | Load settings first; flags below override |
 | `--save-preset <FILE>` | Write the settings actually used |
 
@@ -141,6 +142,15 @@ ana-convert render -i film.mkv -o film-stereo.mkv --preset film.json
 ```bash
 ana-convert render -i sbs.mkv -o glasses.mkv \
   --source sbs --layout anaglyph --output-format green-magenta
+```
+
+**Easing a punishing shot.** Bringing the eyes together moves the plane of zero
+parallax onto something nearer, so the thrown spear sits at the screen instead
+of in the viewer's lap.
+
+```bash
+ana-convert render -i comin-at-ya.mkv -o comfortable.mkv \
+  --start 42:10 --end 42:35 --convergence -2.5
 ```
 
 **One eye out of a half-width broadcast file, as flat 2D.**

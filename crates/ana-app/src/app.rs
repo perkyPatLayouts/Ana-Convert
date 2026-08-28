@@ -265,7 +265,10 @@ impl AnaApp {
         let Some(source) = &self.anaglyph else {
             return 1.0;
         };
-        let eye = self.params.eye_display_aspect(source.info.display_aspect());
+        let eye = self.params.eye_display_aspect(
+            source.info.display_aspect(),
+            (source.info.width, source.info.height),
+        );
         self.view.display_aspect(eye)
     }
 
@@ -983,13 +986,16 @@ impl AnaApp {
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .show(ui, |ui| {
                         ui.add_space(4.0);
-                        self.source_section(ui);
-                        self.secondary_section(ui);
-                        if self.params.input.is_anaglyph() {
-                            self.recovery_section(ui);
+                        for section in visible_sections(self.params.input) {
+                            match section {
+                                Section::Source => self.source_section(ui),
+                                Section::Secondary => self.secondary_section(ui),
+                                Section::Recovery => self.recovery_section(ui),
+                                Section::Convergence => self.convergence_section(ui),
+                                Section::Grade => self.grade_section(ui),
+                                Section::Destination => self.destination_section(ui),
+                            }
                         }
-                        self.grade_section(ui);
-                        self.destination_section(ui);
                         ui.add_space(12.0);
                     });
             });
@@ -1007,6 +1013,30 @@ impl AnaApp {
         ui.add_space(1.0);
         ui.separator();
         ui.add_space(4.0);
+    }
+
+    fn convergence_section(&mut self, ui: &mut egui::Ui) {
+        Self::section(ui, "Convergence");
+        ui.label(
+            egui::RichText::new(
+                "Shifts the eyes against each other. Positive pushes the scene behind \
+                 the screen, negative brings it forward — this places the ground plane \
+                 and relieves aching eyes on high-disparity shots. Only what both eyes \
+                 cover can be kept, so the frame narrows.",
+            )
+            .small(),
+        );
+        ui.add(egui::Slider::new(&mut self.params.convergence, -10.0..=10.0).text("Shift %"));
+        if let Some(source) = &self.anaglyph {
+            let (eye_width, _) = self
+                .params
+                .eye_size((source.info.width, source.info.height));
+            ui.label(
+                egui::RichText::new(convergence_note(eye_width, self.params.convergence))
+                    .small()
+                    .color(SECTION_COLOUR),
+            );
+        }
     }
 
     fn source_section(&mut self, ui: &mut egui::Ui) {
@@ -1745,9 +1775,125 @@ fn codec_name(c: VideoCodec) -> &'static str {
     }
 }
 
+/// A block of settings in the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Source,
+    Secondary,
+    Recovery,
+    Convergence,
+    Grade,
+    Destination,
+}
+
+/// Which sections the panel draws for a given kind of source.
+///
+/// Kept as data rather than as conditionals wrapped around the drawing calls,
+/// so that what a user can actually reach is something a test can assert. A
+/// control that exists, works and cannot be found is indistinguishable from one
+/// that was never written — which is what happened to convergence, and to
+/// right-eye-only output before it.
+pub fn visible_sections(input: ana_core::params::InputMode) -> Vec<Section> {
+    let mut sections = vec![Section::Source, Section::Secondary];
+    // Un-mixing means something only where the eyes arrive mixed together.
+    if input.is_anaglyph() {
+        sections.push(Section::Recovery);
+    }
+    sections.extend([Section::Convergence, Section::Grade, Section::Destination]);
+    sections
+}
+
+/// What a convergence setting costs, for the source actually loaded.
+///
+/// Percent is what gets stored, because it survives a change of resolution and
+/// keeps the preview honest. Pixels are what someone judging a shot thinks in,
+/// so both are shown.
+fn convergence_note(eye_width: usize, percent: f32) -> String {
+    let kept = ana_core::compose::converged_width(eye_width, percent);
+    if kept == eye_width {
+        return "no change".to_string();
+    }
+    format!("{} px narrower, {kept} wide", eye_width - kept)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ana_core::packed::StereoPacking;
+    use ana_core::params::InputMode;
+
+    /// Every kind of source, for checks that must hold across all of them.
+    const EVERY_INPUT: [InputMode; 4] = [
+        InputMode::Anaglyph,
+        InputMode::TwoFiles,
+        InputMode::Packed {
+            packing: StereoPacking::SideBySide,
+            order: EyeOrder::LeftFirst,
+            anamorphic: false,
+        },
+        InputMode::Packed {
+            packing: StereoPacking::TopBottom,
+            order: EyeOrder::LeftFirst,
+            anamorphic: true,
+        },
+    ];
+
+    #[test]
+    fn convergence_is_offered_whatever_the_source_holds() {
+        // It lived inside the recovery section, which only anaglyph sources
+        // draw — so the engine converged every input mode while the control
+        // was reachable from exactly one of them. That is the second feature
+        // to be built, tested, and left unreachable from the window.
+        for input in EVERY_INPUT {
+            assert!(
+                visible_sections(input).contains(&Section::Convergence),
+                "no convergence control for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_is_offered_only_for_anaglyph() {
+        // The converse: nothing that only makes sense when un-mixing an
+        // anaglyph should appear for a source that arrives already separated.
+        for input in EVERY_INPUT {
+            assert_eq!(
+                visible_sections(input).contains(&Section::Recovery),
+                input.is_anaglyph(),
+                "recovery section wrong for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_source_gets_the_sections_that_always_apply() {
+        for input in EVERY_INPUT {
+            let sections = visible_sections(input);
+            for always in [Section::Source, Section::Grade, Section::Destination] {
+                assert!(
+                    sections.contains(&always),
+                    "{always:?} missing for {input:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn convergence_note_reports_the_pixels_given_up() {
+        // The percentage is what gets stored, but a stereographer judges the
+        // shift in pixels, so the concrete number for this source is shown.
+        assert_eq!(convergence_note(1920, 1.5), "28 px narrower, 1892 wide");
+    }
+
+    #[test]
+    fn convergence_note_says_nothing_is_lost_at_zero() {
+        assert_eq!(convergence_note(1920, 0.0), "no change");
+    }
+
+    #[test]
+    fn convergence_note_is_the_same_width_either_way() {
+        assert_eq!(convergence_note(1920, 2.0), convergence_note(1920, -2.0));
+    }
 
     #[test]
     fn eye_order_reads_left_and_right_when_side_by_side() {

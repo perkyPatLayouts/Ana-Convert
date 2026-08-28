@@ -4,7 +4,7 @@
 //! The whole per-frame conversion, wired together.
 
 use crate::blur::gaussian_blur;
-use crate::compose::{stack_horizontal, stack_vertical, EyeOrder, OutputLayout};
+use crate::compose::{converge, stack_horizontal, stack_vertical, EyeOrder, OutputLayout};
 use crate::extract::encode_anaglyph;
 use crate::extract::{extract_eyes, projections};
 use crate::frame::FrameF32;
@@ -141,27 +141,19 @@ pub fn process_frame(sources: Sources<'_>, params: &ConvertParams) -> StereoPair
         from_linear_frame(&mut left, tf);
         from_linear_frame(&mut right, tf);
     }
-    apply_grade(&mut left, &params.grade_left);
-    apply_grade(&mut right, &params.grade_right);
 
-    // 8. A 2D release, if supplied, overrides its eye entirely — including the
-    //    grade, which exists to bring the *recovered* eye into line with it.
-    if let Some(mono) = sources.mono {
-        match params.mono_eye {
-            MonoEye::Left => left = mono.clone(),
-            MonoEye::Right => right = mono.clone(),
-            MonoEye::None => {}
-        }
-    }
-
-    if params.swap_eyes {
-        std::mem::swap(&mut left, &mut right);
-    }
-    StereoPair { left, right }
+    // 8. Grade, 2D substitution, swap and convergence, through the same helper
+    //    the other input modes use. This path used to repeat those steps
+    //    inline, which is precisely how convergence came to work everywhere
+    //    except the commonest source in the program.
+    let mut pair = StereoPair { left, right };
+    finish_pair(&mut pair, sources, params);
+    pair
 }
 
-/// Grading, 2D substitution and eye swapping — the steps every input mode ends
-/// with, kept in one place so they cannot drift apart between modes.
+/// Grading, 2D substitution, eye swapping and convergence — the steps every
+/// input mode ends with, kept in one place so they cannot drift apart between
+/// modes.
 fn finish_pair(pair: &mut StereoPair, sources: Sources<'_>, params: &ConvertParams) {
     apply_grade(&mut pair.left, &params.grade_left);
     apply_grade(&mut pair.right, &params.grade_right);
@@ -174,6 +166,14 @@ fn finish_pair(pair: &mut StereoPair, sources: Sources<'_>, params: &ConvertPara
     }
     if params.swap_eyes {
         std::mem::swap(&mut pair.left, &mut pair.right);
+    }
+    // After the swap, so that "right eye" means the one the viewer's right eye
+    // will see rather than whichever the source file happened to hold. Last,
+    // so it applies once to every input mode and every layout.
+    if params.convergence != 0.0 {
+        let (left, right) = converge(&pair.left, &pair.right, params.convergence);
+        pair.left = left;
+        pair.right = right;
     }
 }
 
@@ -214,6 +214,67 @@ pub fn compose_output(pair: &StereoPair, params: &ConvertParams) -> Vec<FrameF32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn convergence_reaches_every_input_mode_through_the_public_entry_point() {
+        // finish_pair is only reached by the packed and two-file paths: the
+        // anaglyph path grades, substitutes and swaps inline. Testing the
+        // helper alone would have passed while the main use case did nothing.
+        for input in [
+            InputMode::Anaglyph,
+            InputMode::TwoFiles,
+            InputMode::Packed {
+                packing: crate::packed::StereoPacking::SideBySide,
+                order: EyeOrder::LeftFirst,
+                anamorphic: true,
+            },
+        ] {
+            let params = ConvertParams {
+                input,
+                convergence: 10.0,
+                ..Default::default()
+            };
+            let frame = FrameF32::filled(100, 4, 3, 0.5);
+            let pair = process_frame(Sources::from_anaglyph(&frame), &params);
+            assert_eq!(
+                (pair.left.width(), pair.right.width()),
+                (90, 90),
+                "convergence was ignored for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn convergence_applies_to_every_input_mode_and_after_the_swap() {
+        // finish_pair is the one place every mode passes through, and the
+        // shift has to land after swap_eyes or "right eye" means whichever
+        // eye the source file happened to hold rather than the one the
+        // viewer's right eye sees.
+        let params = ConvertParams {
+            convergence: 10.0,
+            swap_eyes: true,
+            ..Default::default()
+        };
+        let mut pair = StereoPair {
+            left: FrameF32::filled(100, 4, 3, 0.0),
+            right: FrameF32::filled(100, 4, 3, 1.0),
+        };
+        let primary = FrameF32::filled(100, 4, 3, 0.0);
+        let sources = Sources {
+            primary: &primary,
+            right_eye: None,
+            colour: None,
+            mono: None,
+        };
+        finish_pair(&mut pair, sources, &params);
+        assert_eq!(pair.left.width(), 90, "left eye was not converged");
+        assert_eq!(pair.right.width(), 90, "right eye was not converged");
+        assert_eq!(
+            pair.left.plane(0)[0],
+            1.0,
+            "the swap should have happened before the shift"
+        );
+    }
     use crate::compose::OutputLayout;
     use crate::extract::AnaglyphFormat;
     use crate::grade::Grade;

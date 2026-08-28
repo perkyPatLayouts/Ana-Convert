@@ -201,6 +201,18 @@ pub struct ConvertParams {
     /// The part of the 2D eye source that lines up with it.
     pub mono_trim: SourceTrim,
 
+    /// Horizontal convergence, as a percentage of frame width.
+    ///
+    /// Positive moves the eyes apart and the scene behind the screen; negative
+    /// brings them together and the scene forward, placing the plane of zero
+    /// parallax — the ground plane — where the viewer wants it. High-disparity
+    /// shots are what make this worth having: the depth that reads as thrown
+    /// at the camera is also what makes an audience's eyes ache.
+    ///
+    /// The output keeps only what both eyes cover, so it narrows by exactly
+    /// this percentage.
+    pub convergence: f32,
+
     /// Exchange the two eyes before layout.
     pub swap_eyes: bool,
     pub layout: OutputLayout,
@@ -232,6 +244,7 @@ impl Default for ConvertParams {
             anaglyph_trim: SourceTrim::whole(),
             colour_trim: SourceTrim::whole(),
             mono_trim: SourceTrim::whole(),
+            convergence: 0.0,
             swap_eyes: false,
             layout: OutputLayout::SideBySide,
             eye_order: EyeOrder::LeftFirst,
@@ -302,6 +315,7 @@ impl ConvertParams {
             return size;
         }
         let (w, h) = self.eye_size(source);
+        let w = crate::compose::converged_width(w, self.convergence);
         match self.layout {
             OutputLayout::SideBySide => (w * 2, h),
             OutputLayout::TopBottom => (w, h * 2),
@@ -316,7 +330,19 @@ impl ConvertParams {
     ///
     /// `source_display_aspect` is the shape the whole source frame is meant to
     /// be seen at, pixel shape already accounted for.
-    pub fn eye_display_aspect(&self, source_display_aspect: f64) -> f64 {
+    pub fn eye_display_aspect(&self, source_display_aspect: f64, source: (usize, usize)) -> f64 {
+        let packed = self.packed_eye_display_aspect(source_display_aspect);
+        // Cropping narrows the picture without touching pixel shape, so the
+        // shape must narrow with it. Taking the ratio from the pixel widths
+        // rather than from the percentage keeps this in step with
+        // output_geometry even when the shift rounds.
+        let (w, _) = self.eye_size(source);
+        let kept = crate::compose::converged_width(w, self.convergence);
+        packed * kept as f64 / w as f64
+    }
+
+    /// The eye's shape from packing alone, before convergence crops it.
+    fn packed_eye_display_aspect(&self, source_display_aspect: f64) -> f64 {
         match self.input {
             // The eye is the whole frame.
             InputMode::Anaglyph | InputMode::TwoFiles => source_display_aspect,
@@ -342,8 +368,8 @@ impl ConvertParams {
     /// Stacking two eyes doubles the width or the height, so the shape of the
     /// output is not the shape of an eye. Without this the encoder assumes
     /// square pixels and every non-square source comes out stretched.
-    pub fn output_display_aspect(&self, source_display_aspect: f64) -> f64 {
-        let eye = self.eye_display_aspect(source_display_aspect);
+    pub fn output_display_aspect(&self, source_display_aspect: f64, source: (usize, usize)) -> f64 {
+        let eye = self.eye_display_aspect(source_display_aspect, source);
         match self.layout {
             OutputLayout::SideBySide => eye * 2.0,
             OutputLayout::TopBottom => eye / 2.0,
@@ -373,6 +399,7 @@ impl ConvertParams {
         range("decimate_vert", self.decimate_vert, 0.1, 100.0)?;
         range("leak_correct_left", self.leak_correct_left, -100.0, 100.0)?;
         range("leak_correct_right", self.leak_correct_right, -100.0, 100.0)?;
+        range("convergence", self.convergence, -10.0, 10.0)?;
         range("defringe_left", self.defringe_left, 1.0, 32.0)?;
         range("defringe_right", self.defringe_right, 1.0, 32.0)?;
 
@@ -394,6 +421,79 @@ mod tests {
     /// dimensions suggest.
     const REAL_DAR: f64 = 472.0 / 207.0;
 
+    /// Aspect is independent of frame size unless convergence crops it, so
+    /// tests that are not about convergence can pass any size.
+    const ANY_SIZE: (usize, usize) = (1920, 1080);
+
+    #[test]
+    fn convergence_narrows_the_output() {
+        let params = ConvertParams {
+            convergence: 4.0,
+            layout: OutputLayout::LeftOnly,
+            ..Default::default()
+        };
+        assert_eq!(params.output_geometry((100, 50)), (96, 50));
+    }
+
+    #[test]
+    fn convergence_narrows_the_display_aspect_by_exactly_what_it_crops() {
+        // The failure this guards against is the one that reached the user
+        // three times: geometry and aspect computed by separate routes, then
+        // disagreeing, so every frame comes out stretched. Both must fall out
+        // of the same crop.
+        let params = ConvertParams {
+            convergence: 6.0,
+            layout: OutputLayout::LeftOnly,
+            ..Default::default()
+        };
+        let source = (1000, 500);
+        let (out_w, _) = params.output_geometry(source);
+        let plain = ConvertParams {
+            layout: OutputLayout::LeftOnly,
+            ..Default::default()
+        };
+        let pixel_ratio = out_w as f64 / plain.output_geometry(source).0 as f64;
+        let aspect_ratio = params.output_display_aspect(REAL_DAR, source)
+            / plain.output_display_aspect(REAL_DAR, source);
+        assert!(
+            (pixel_ratio - aspect_ratio).abs() < 1e-9,
+            "cropped {pixel_ratio}x the pixels but {aspect_ratio}x the shape"
+        );
+    }
+
+    #[test]
+    fn convergence_leaves_a_side_by_side_pair_stackable() {
+        // Both eyes lose the same width, so the stacked frame stays exactly
+        // twice one eye. 3% of 800 is 24px of overlap given up in total —
+        // 12 from each eye — leaving 776.
+        let params = ConvertParams {
+            convergence: -3.0,
+            layout: OutputLayout::SideBySide,
+            ..Default::default()
+        };
+        let (w, h) = params.output_geometry((800, 400));
+        assert_eq!((w, h), (2 * 776, 400));
+    }
+
+    #[test]
+    fn zero_convergence_changes_no_geometry() {
+        let params = ConvertParams {
+            layout: OutputLayout::LeftOnly,
+            ..Default::default()
+        };
+        assert_eq!(params.output_geometry((640, 480)), (640, 480));
+        assert_eq!(params.output_display_aspect(REAL_DAR, (640, 480)), REAL_DAR);
+    }
+
+    #[test]
+    fn convergence_past_the_limit_is_rejected() {
+        let params = ConvertParams {
+            convergence: 25.0,
+            ..Default::default()
+        };
+        assert!(params.validate().is_err(), "25% should be out of range");
+    }
+
     #[test]
     fn an_explicit_output_size_still_shows_the_right_shape() {
         // Resizing changes how many pixels are stored, not what the picture
@@ -407,7 +507,7 @@ mod tests {
         };
         assert_eq!(p.output_geometry((708, 276)), (1920, 1080));
         assert!(
-            (p.output_display_aspect(REAL_DAR) - REAL_DAR).abs() < 1e-9,
+            (p.output_display_aspect(REAL_DAR, ANY_SIZE) - REAL_DAR).abs() < 1e-9,
             "the shape must survive the resize"
         );
     }
@@ -415,7 +515,7 @@ mod tests {
     #[test]
     fn an_anaglyph_eye_keeps_the_whole_frames_shape() {
         let p = ConvertParams::default();
-        assert!((p.eye_display_aspect(REAL_DAR) - REAL_DAR).abs() < 1e-9);
+        assert!((p.eye_display_aspect(REAL_DAR, ANY_SIZE) - REAL_DAR).abs() < 1e-9);
     }
 
     #[test]
@@ -424,7 +524,7 @@ mod tests {
             layout: OutputLayout::SideBySide,
             ..Default::default()
         };
-        assert!((p.output_display_aspect(REAL_DAR) - REAL_DAR * 2.0).abs() < 1e-9);
+        assert!((p.output_display_aspect(REAL_DAR, ANY_SIZE) - REAL_DAR * 2.0).abs() < 1e-9);
     }
 
     #[test]
@@ -433,7 +533,7 @@ mod tests {
             layout: OutputLayout::TopBottom,
             ..Default::default()
         };
-        assert!((p.output_display_aspect(REAL_DAR) - REAL_DAR / 2.0).abs() < 1e-9);
+        assert!((p.output_display_aspect(REAL_DAR, ANY_SIZE) - REAL_DAR / 2.0).abs() < 1e-9);
     }
 
     #[test]
@@ -449,7 +549,7 @@ mod tests {
                 ..Default::default()
             };
             assert!(
-                (p.output_display_aspect(REAL_DAR) - REAL_DAR).abs() < 1e-9,
+                (p.output_display_aspect(REAL_DAR, ANY_SIZE) - REAL_DAR).abs() < 1e-9,
                 "{layout:?}"
             );
         }
@@ -462,7 +562,7 @@ mod tests {
             input: InputMode::packed(StereoPacking::SideBySide, false),
             ..Default::default()
         };
-        assert!((p.eye_display_aspect(32.0 / 9.0) - 16.0 / 9.0).abs() < 1e-9);
+        assert!((p.eye_display_aspect(32.0 / 9.0, ANY_SIZE) - 16.0 / 9.0).abs() < 1e-9);
     }
 
     #[test]
@@ -473,7 +573,7 @@ mod tests {
             input: InputMode::packed(StereoPacking::SideBySide, true),
             ..Default::default()
         };
-        assert!((p.eye_display_aspect(16.0 / 9.0) - 16.0 / 9.0).abs() < 1e-9);
+        assert!((p.eye_display_aspect(16.0 / 9.0, ANY_SIZE) - 16.0 / 9.0).abs() < 1e-9);
     }
 
     #[test]
@@ -483,7 +583,7 @@ mod tests {
             input: InputMode::packed(StereoPacking::TopBottom, false),
             ..Default::default()
         };
-        assert!((p.eye_display_aspect(8.0 / 9.0) - 16.0 / 9.0).abs() < 1e-9);
+        assert!((p.eye_display_aspect(8.0 / 9.0, ANY_SIZE) - 16.0 / 9.0).abs() < 1e-9);
     }
 
     #[test]
@@ -495,7 +595,7 @@ mod tests {
             layout: OutputLayout::SideBySide,
             ..Default::default()
         };
-        assert!((p.output_display_aspect(32.0 / 9.0) - 32.0 / 9.0).abs() < 1e-9);
+        assert!((p.output_display_aspect(32.0 / 9.0, ANY_SIZE) - 32.0 / 9.0).abs() < 1e-9);
     }
 
     #[test]

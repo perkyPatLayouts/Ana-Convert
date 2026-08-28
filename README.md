@@ -73,6 +73,15 @@ ana-convert render -i film.mkv -o stereo.mkv
 See the [CLI reference](docs/CLI.md). Presets are the same JSON in both, so a
 look tuned in the app renders headlessly.
 
+## Convergence
+
+Anaglyph features were graded for a cinema screen, often for an audience the
+film wanted to flinch. On a monitor the same disparity is just painful. The
+convergence control shifts the eyes against each other, moving the plane of zero
+parallax — the depth the viewer reads as *the screen* — onto whatever the shot
+is really about. The output keeps only what both eyes still cover, so it narrows
+by the percentage asked for.
+
 ## The single biggest improvement
 
 If the disc carries a 2D version of the film, use it. The anaglyph's own colours
