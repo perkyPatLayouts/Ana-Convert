@@ -25,8 +25,16 @@ ROOT = Path(__file__).resolve().parent.parent
 PACKAGING = ROOT / "packaging"
 APP = ROOT / "target" / "Stereoscopic Converter.app"
 BINARY = "ana-convert-app"
+ENTITLEMENTS = PACKAGING / "entitlements.plist"
+CASK = PACKAGING / "stereoscopic-converter.rb"
 # Anything under these prefixes ships with macOS and must not be copied.
 SYSTEM_PREFIXES = ("/usr/lib", "/System")
+# The ffmpeg a release is expected to carry. Whatever is on PATH at build time
+# gets copied in, signed, and shipped to everyone, so it must be the version
+# that was actually looked at — not merely the one Homebrew happened to have
+# that morning. docs/DOWNLOAD.md states this number to users; the two move
+# together or not at all.
+FFMPEG_VERSION = "9.0.1"
 
 
 def run(cmd, **kw):
@@ -34,6 +42,19 @@ def run(cmd, **kw):
     if result.returncode != 0:
         sys.exit(f"failed: {' '.join(str(c) for c in cmd)}\n{result.stderr.strip()}")
     return result.stdout
+
+
+def sha256_of(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def ffmpeg_version(binary: Path) -> str:
+    """The version string a copied ffmpeg reports about itself."""
+    first = run([str(binary), "-version"]).splitlines()[0]
+    # "ffmpeg version 9.0.1 Copyright (c) ..." — and on a build from source,
+    # something like "ffmpeg version n9.0.1-2-gabc123".
+    parts = first.split()
+    return parts[2].lstrip("n") if len(parts) > 2 else "unknown"
 
 
 def linked_libraries(binary: Path) -> list[str]:
@@ -84,6 +105,11 @@ def main():
     parser.add_argument("--verify", action="store_true", help="check self-containment")
     parser.add_argument("--dmg", action="store_true", help="package for download")
     parser.add_argument("--sign", default="-", help="signing identity, default ad-hoc")
+    parser.add_argument(
+        "--ffmpeg-version",
+        default=FFMPEG_VERSION,
+        help=f"the ffmpeg this build expects to find on PATH (default {FFMPEG_VERSION})",
+    )
     args = parser.parse_args()
 
     print("building release binary…")
@@ -123,6 +149,22 @@ def main():
         shutil.copy2(os.path.realpath(found), target)
         tools.append(target)
 
+    # Whatever was on PATH is now inside a bundle that will be signed and handed
+    # to people. Refusing an unexpected version is the only moment this can be
+    # caught: afterwards it is indistinguishable from the one that was reviewed.
+    found_version = ffmpeg_version(macos / "ffmpeg")
+    if found_version != args.ffmpeg_version:
+        sys.exit(
+            f"  PATH has ffmpeg {found_version}, but this release is built "
+            f"against {args.ffmpeg_version}.\n"
+            f"  Install the expected version, or — having checked what changed "
+            f"in it — update FFMPEG_VERSION in {Path(__file__).name} and the "
+            f"version named in docs/DOWNLOAD.md, then build again.\n"
+            f"  To build a one-off without moving those, pass "
+            f"--ffmpeg-version {found_version}."
+        )
+    print(f"  ffmpeg {found_version}")
+
     closure = gather_closure(tools)
     print(f"  {len(closure)} libraries")
     for name, source in closure.items():
@@ -145,10 +187,20 @@ def main():
 
     # Signing must come last: rewriting install names invalidates a signature,
     # and nested code has to be signed before the bundle that contains it.
-    print(f"signing (identity {args.sign!r})…")
+    print(f"signing (identity {args.sign!r}, hardened runtime)…")
+    sign = [
+        "codesign",
+        "--force",
+        "--timestamp=none",
+        "--options", "runtime",
+        "--entitlements", str(ENTITLEMENTS),
+        "--sign", args.sign,
+    ]
     for path in list(frameworks.iterdir()) + tools + [macos / BINARY]:
-        run(["codesign", "--force", "--timestamp=none", "--sign", args.sign, str(path)])
-    run(["codesign", "--force", "--timestamp=none", "--sign", args.sign, str(APP)])
+        run(sign + [str(path)])
+    run(sign + [str(APP)])
+
+    record_provenance(found_version, macos, frameworks)
 
     size = sum(f.stat().st_size for f in APP.rglob("*") if f.is_file())
     print(f"\n{APP}  ({size / 1024 / 1024:.0f} MB)")
@@ -157,6 +209,30 @@ def main():
         verify(macos)
     if args.dmg:
         build_dmg()
+
+
+def record_provenance(version: str, macos: Path, frameworks: Path):
+    """Writes down exactly which third-party binaries went into this build.
+
+    Vendoring means the app ships someone else's code under our signature. A
+    release that cannot say which ffmpeg it contains cannot answer the only
+    question that matters when an advisory comes out.
+    """
+    manifest = ROOT / "target" / "vendored-ffmpeg.txt"
+    lines = [
+        f"ffmpeg version: {version}",
+        "signed into: " + APP.name,
+        "",
+        "sha256 of each vendored binary, as copied (before signing rewrote it):",
+        "",
+    ]
+    for path in sorted(
+        list(frameworks.iterdir()) + [macos / "ffmpeg", macos / "ffprobe"],
+        key=lambda p: p.name,
+    ):
+        lines.append(f"{sha256_of(path)}  {path.name}")
+    manifest.write_text("\n".join(lines) + "\n")
+    print(f"  provenance written to {manifest.relative_to(ROOT)}")
 
 
 def build_dmg():
@@ -195,11 +271,33 @@ def build_dmg():
 
     verify_dmg(dmg)
 
-    digest = hashlib.sha256(dmg.read_bytes()).hexdigest()
+    digest = sha256_of(dmg)
     print(f"\n{dmg}  ({dmg.stat().st_size / 1024 / 1024:.0f} MB)")
-    print("\nfor packaging/stereoscopic-converter.rb:")
-    print(f'  version "{version}"')
-    print(f'  sha256 "{digest}"')
+
+    # An unnotarised download asks people to trust it on our say-so. The least
+    # it can do is let them check that what arrived is what left — so the digest
+    # is written to a file to publish alongside the image, rather than printed
+    # for someone to copy by hand at the end of a long build.
+    sums = dmg.with_suffix(".dmg.sha256")
+    sums.write_text(f"{digest}  {dmg.name}\n")
+    print(f"{sums}")
+
+    # The cask filled in, rather than the numbers printed for transcription.
+    # A hash that has to be copied by hand is a hash that can be copied wrong.
+    filled = []
+    for line in CASK.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#~"):
+            # A note to whoever edits the template, not to whoever reads the tap.
+            continue
+        if stripped.startswith("version "):
+            line = f'  version "{version}"'
+        elif stripped.startswith("sha256 "):
+            line = f'  sha256 "{digest}"'
+        filled.append(line)
+    ready = ROOT / "target" / CASK.name
+    ready.write_text("\n".join(filled) + "\n")
+    print(f"{ready}  (cask with version and sha256 filled in)")
 
 
 def verify_dmg(dmg: Path):
@@ -249,6 +347,58 @@ def verify(macos: Path):
     if leaked:
         sys.exit("  still pointing outside the bundle:\n    " + "\n    ".join(leaked))
     print("  no references escape the bundle")
+
+    # The app's own binary, not just the tools it drives. It finds and runs the
+    # bundled ffmpeg, so this exercises the whole chain the hardened runtime
+    # could have broken.
+    out = subprocess.run(
+        [str(macos / BINARY), "--check"],
+        capture_output=True,
+        text=True,
+        env=bare,
+    )
+    if out.returncode != 0:
+        sys.exit(f"  the app will not start:\n{out.stderr.strip()}")
+    print("  the app starts and finds its own tools")
+
+    verify_injection_is_refused(macos)
+
+
+def verify_injection_is_refused(macos: Path):
+    """Checks that the hardened runtime is doing the thing it is here for.
+
+    Without it, DYLD_INSERT_LIBRARIES loads any dylib into the app before its
+    own code runs. The flag is easy to lose in a signing change and nothing
+    else would notice, so it is proved rather than assumed.
+    """
+    source = ROOT / "target" / "injection-probe.c"
+    dylib = ROOT / "target" / "injection-probe.dylib"
+    source.write_text(
+        '#include <stdio.h>\n'
+        '__attribute__((constructor)) static void probe(void) {\n'
+        '    fprintf(stderr, "INJECTED\\n");\n'
+        '}\n'
+    )
+    built = subprocess.run(
+        ["clang", "-dynamiclib", "-o", str(dylib), str(source)],
+        capture_output=True,
+        text=True,
+    )
+    if built.returncode != 0:
+        print("  (skipped the injection check: no working clang)")
+        return
+
+    attempt = subprocess.run(
+        [str(macos / "ffmpeg"), "-version"],
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "DYLD_INSERT_LIBRARIES": str(dylib)},
+    )
+    source.unlink(missing_ok=True)
+    dylib.unlink(missing_ok=True)
+    if "INJECTED" in attempt.stderr:
+        sys.exit("  DYLD_INSERT_LIBRARIES loaded code into the app — runtime flag lost")
+    print("  injected libraries are refused")
 
 
 if __name__ == "__main__":

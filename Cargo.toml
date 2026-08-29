@@ -24,3 +24,8 @@ thiserror = "2"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+# Frame dimensions come from files and presets, and dimensions are what buffer
+# arithmetic is made of. Both are bounded at the door, so this should never
+# fire — it is here so that if one ever slips through, the release build stops
+# rather than wrapping and carrying on with a nonsense size.
+overflow-checks = true

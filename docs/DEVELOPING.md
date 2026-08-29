@@ -136,8 +136,21 @@ the executable, which is where they land.
 Signing comes last: rewriting install names invalidates a signature, and nested
 code must be signed before the bundle containing it.
 
-`--verify` checks the signature, runs the bundled ffmpeg with `PATH` emptied,
-and fails if any library still refers to `/opt` or `/usr/local`.
+`--verify` checks the signature, runs the bundled ffmpeg *and the app itself*
+with `PATH` emptied, fails if any library still refers to `/opt` or
+`/usr/local`, and proves that `DYLD_INSERT_LIBRARIES` cannot load code into the
+app.
+
+The ffmpeg that gets vendored is whatever is on `PATH`, so the build refuses to
+proceed unless it reports the version in `FFMPEG_VERSION` — otherwise a release
+ships whichever ffmpeg Homebrew happened to have that morning, signed by us, and
+afterwards there is no way to tell which one it was. `target/vendored-ffmpeg.txt`
+records the SHA-256 of every third-party binary that went in.
+
+**When ffmpeg publishes a security release**, that is a release of this app too.
+The bundle is the only ffmpeg its users have and nothing updates it for them:
+bump `FFMPEG_VERSION`, the version in [DOWNLOAD.md](DOWNLOAD.md), and cut a new
+image.
 
 The icon is drawn by `packaging/make-icon.py` rather than checked in, so there
 is no binary asset to lose and the design can be read.
@@ -153,17 +166,45 @@ serve them; the script is what defines them.
 Signing is **ad-hoc**, which on Apple Silicon is not optional — an unsigned
 binary will not execute at all — but carries no developer identity, so
 Gatekeeper rejects a downloaded copy. `--sign "Developer ID Application: …"`
-takes a real identity if you ever have one; notarising on top of that also needs
-`--options runtime` and a secure timestamp, neither of which is set here.
+takes a real identity if you ever have one. Notarising on top of that also needs
+a secure timestamp, which is still off.
 [Download and install](DOWNLOAD.md) is how the app is distributed without one.
+
+The hardened runtime **is** on, with
+`packaging/entitlements.plist`. It is what stops `DYLD_INSERT_LIBRARIES` loading
+someone else's dylib into the app before its own code runs, and stops another
+process attaching to it — `--verify` demonstrates the first rather than assuming
+it.
+
+Getting it required giving up library validation, and the reason is worth
+recording because it looks like a mistake otherwise. Library validation demands
+that every loaded library carry the same Team ID as the process loading it. An
+ad-hoc signature carries no Team ID, and macOS does not treat two absent Team IDs
+as a match — so the bundled ffmpeg is refused its own vendored `libavcodec` and
+dies at `dyld`. There is no way around it without a Developer ID.
+
+What that leaves open: anything already running as your user can replace a dylib
+inside the installed bundle, and it will be loaded. That is the same exposure as
+replacing the executable, which nothing prevents either once quarantine has been
+cleared. A Developer ID and `--options library-validation` is the only real fix,
+and it costs $99 a year.
 
 ## Packaging for download
 
 `build-app.py --dmg` writes `target/StereoscopicConverter-<version>.dmg` with an
-`/Applications` symlink beside the app, then prints the version and sha256 to
-paste into `packaging/stereoscopic-converter.rb`. The version is read from the
+`/Applications` symlink beside the app. The version is read from the
 `Info.plist` that shipped rather than from `Cargo.toml`, so the file name cannot
 disagree with what the app reports about itself.
+
+Two more files come out beside it, and both belong in the release:
+
+- `StereoscopicConverter-<version>.dmg.sha256` — publish it as a release asset.
+  It is the only way someone taking the direct download can tell that what
+  arrived is what was built, and an unnotarised app has no other answer.
+- `stereoscopic-converter.rb` — the cask with version and digest already
+  substituted, to copy into the tap. The digest is never transcribed by hand;
+  the one in `packaging/` is a template and its `sha256` is a placeholder that
+  will not match anything.
 
 It verifies the signature on the copy *inside* the mounted image. Packaging is
 where a signature gets broken, so verifying the bundle it was made from would

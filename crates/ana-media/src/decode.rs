@@ -14,7 +14,7 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use ana_core::FrameF32;
 
 use crate::probe::{SourceDepth, VideoInfo};
-use crate::{FfmpegTools, MediaError};
+use crate::{file_arg, FfmpegTools, MediaError};
 
 /// Streams frames out of a file in order.
 ///
@@ -193,7 +193,7 @@ pub fn grab_frame(
 /// landing early or late on long-GOP sources.
 fn apply_seek(command: &mut Command, path: &Path, info: &VideoInfo, index: u64) {
     if index == 0 || info.fps <= 0.0 {
-        command.arg("-i").arg(path);
+        command.arg("-i").arg(file_arg(path));
         return;
     }
     let lead_in = 1.0_f64.min(index as f64 / info.fps);
@@ -202,7 +202,7 @@ fn apply_seek(command: &mut Command, path: &Path, info: &VideoInfo, index: u64) 
     command
         .args(["-ss", &format!("{seek_to:.6}")])
         .arg("-i")
-        .arg(path)
+        .arg(file_arg(path))
         // `-fps_mode passthrough` stops ffmpeg duplicating or dropping frames
         // to hit a target rate. It replaced `-vsync`, removed in ffmpeg 8.
         .args([
@@ -463,6 +463,35 @@ mod tests {
 
         let mut decoder = Decoder::open_at(&t, &clip, &info, 500).expect("open");
         assert!(decoder.next_frame().expect("decode").is_none());
+    }
+
+    #[test]
+    fn a_filename_is_never_taken_as_an_ffmpeg_protocol() {
+        // The same rule the probe follows: what is handed over is a file name,
+        // never a URL for ffmpeg to go and resolve.
+        let t = tools();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clip = dir.path().join("clip.mkv");
+        make_test_clip(&t, &clip, 64, 48, 5, 10.0);
+        let info = probe(&t, &clip).expect("probe");
+
+        let disguised = PathBuf::from(format!("cache:file:{}", clip.display()));
+        assert!(
+            grab_frame(&t, &disguised, &info, 0).is_err(),
+            "the cache: protocol was resolved instead of looking for a file of that name"
+        );
+    }
+
+    #[test]
+    fn a_path_containing_a_colon_still_decodes() {
+        let t = tools();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clip = dir.path().join("my:film.mkv");
+        make_test_clip(&t, &clip, 64, 48, 5, 10.0);
+        let info = probe(&t, &clip).expect("probe");
+
+        let frame = grab_frame(&t, &clip, &info, 1).expect("grab");
+        assert_eq!((frame.width(), frame.height()), (64, 48));
     }
 
     #[test]

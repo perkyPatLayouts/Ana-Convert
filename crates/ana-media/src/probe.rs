@@ -9,7 +9,9 @@
 
 use std::path::Path;
 
-use crate::{FfmpegTools, MediaError};
+use ana_core::params::MAX_DIMENSION;
+
+use crate::{file_arg, FfmpegTools, MediaError};
 
 /// What one source file contains.
 #[derive(Debug, Clone, PartialEq)]
@@ -110,7 +112,7 @@ pub fn probe(tools: &FfmpegTools, path: &Path) -> Result<VideoInfo, MediaError> 
             "-of",
             "json",
         ])
-        .arg(path)
+        .arg(file_arg(path))
         .output()
         .map_err(|source| MediaError::Io {
             path: tools.ffprobe.clone(),
@@ -167,6 +169,12 @@ pub(crate) fn parse_probe_json(json: &str) -> Result<VideoInfo, MediaError> {
     let height = uint(video, "height")
         .ok_or_else(|| MediaError::ProbeParse("video stream has no height".into()))?
         as usize;
+
+    // Believed without question, these size every buffer the decode allocates,
+    // and they are whatever the container says they are.
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(MediaError::ImplausibleGeometry { width, height });
+    }
 
     // avg_frame_rate first, deliberately. r_frame_rate is the lowest rate that
     // can represent every timestamp, which on a real 29.97 disc rip reads as a
@@ -265,6 +273,7 @@ fn bit_depth_of(pix_fmt: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn video_stream(extra: &str) -> String {
         format!(
@@ -449,6 +458,28 @@ mod tests {
     }
 
     #[test]
+    fn an_implausible_frame_size_is_refused_rather_than_believed() {
+        // These numbers come out of the file's own metadata, so a corrupt or
+        // hostile container can claim anything — and whatever it claims becomes
+        // the size of every buffer the decode allocates.
+        let json = video_stream("").replace(r#""width":1920"#, r#""width":4000000000"#);
+        assert!(
+            parse_probe_json(&json).is_err(),
+            "a four-billion-pixel width was taken at face value"
+        );
+    }
+
+    #[test]
+    fn an_eight_k_frame_is_still_accepted() {
+        // The bound must sit well above anything a real transfer contains.
+        let json = video_stream("")
+            .replace(r#""width":1920"#, r#""width":7680"#)
+            .replace(r#""height":1080"#, r#""height":4320"#);
+        let info = parse_probe_json(&json).expect("8K is a real size");
+        assert_eq!((info.width, info.height), (7680, 4320));
+    }
+
+    #[test]
     fn malformed_output_is_an_error_rather_than_a_panic() {
         assert!(parse_probe_json("not json at all").is_err());
         assert!(parse_probe_json("{}").is_err());
@@ -469,6 +500,35 @@ mod tests {
         assert_eq!(info.estimated_frame_count(), Some(10));
         assert!(info.has_audio, "the fixture includes an audio track");
         assert_eq!(info.source_depth(), SourceDepth::Eight);
+    }
+
+    #[test]
+    fn a_filename_is_never_taken_as_an_ffmpeg_protocol() {
+        // ffmpeg resolves protocol prefixes inside input names, so a file whose
+        // name begins with one — `cache:`, `concat:`, `http:` — would be fetched
+        // through that protocol rather than opened. A name is a name.
+        let (tools, _) = crate::locate(None).expect("ffmpeg must be installed");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clip = dir.path().join("clip.mkv");
+        crate::testing::make_test_clip(&tools, &clip, 64, 48, 5, 10.0);
+
+        let disguised = PathBuf::from(format!("cache:file:{}", clip.display()));
+        assert!(
+            probe(&tools, &disguised).is_err(),
+            "the cache: protocol was resolved instead of looking for a file of that name"
+        );
+    }
+
+    #[test]
+    fn a_path_containing_a_colon_still_probes() {
+        // The guard against the fix above overreaching: colons are legal in
+        // file names and must keep working.
+        let (tools, _) = crate::locate(None).expect("ffmpeg must be installed");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clip = dir.path().join("my:film.mkv");
+        crate::testing::make_test_clip(&tools, &clip, 64, 48, 5, 10.0);
+
+        assert_eq!(probe(&tools, &clip).expect("probe").width, 64);
     }
 
     #[test]

@@ -34,6 +34,29 @@ Without it you will see the warning below.
 
 ---
 
+## Check what you downloaded
+
+Every release publishes a `.sha256` file next to the disk image. Since you are
+being asked to trust the download rather than Apple's check on it, it is worth
+knowing that what arrived is what was built:
+
+```bash
+shasum -a 256 -c StereoscopicConverter-0.1.0.dmg.sha256
+```
+
+`OK` means the file is byte-for-byte the one released. Anything else — a
+truncated download, a proxy that rewrote it, a file from somewhere other than
+the Releases page — will not match.
+
+This proves the image was not altered in transit. It cannot tell you the build
+itself is trustworthy; only reading the source and building it yourself does
+that, and the last section explains how.
+
+The Homebrew route checks the same digest automatically: it is written into the
+cask, and `brew` refuses an image that does not match.
+
+---
+
 ## "The application is damaged and can't be opened"
 
 The app is not damaged. This is the message macOS shows for an application that
@@ -77,7 +100,9 @@ Stereoscopic Converter is free software under the
 [GPL-3.0-or-later](https://www.gnu.org/licenses/gpl-3.0.html). The source is at
 [github.com/perkyPatLayouts/Ana-Convert](https://github.com/perkyPatLayouts/Ana-Convert).
 
-The app bundles **FFmpeg 9.0.1**, built with `--enable-gpl --enable-version3`
+The app bundles **FFmpeg 9.0.1** — the build refuses to package any other
+version, and `target/vendored-ffmpeg.txt` records the SHA-256 of every binary
+that went in. It is built with `--enable-gpl --enable-version3`
 and also covered by the GPL. Its corresponding source is available from
 [ffmpeg.org/releases](https://ffmpeg.org/releases/) as `ffmpeg-9.0.1.tar.xz`,
 and the build configuration used is the

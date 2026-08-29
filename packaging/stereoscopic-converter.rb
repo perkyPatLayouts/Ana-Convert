@@ -7,7 +7,16 @@
 # rather than notarised, so a quarantined copy is refused by Gatekeeper with a
 # message claiming the app is damaged. Never setting the bit avoids that.
 #
-# `build-app.py --dmg` prints the version and sha256 to paste in below.
+#~ Lines marked `#~` are notes to whoever edits this template. They are dropped
+#~ from the copy `build-app.py --dmg` generates, so they never reach the tap.
+#~
+#~ This file is a TEMPLATE. The sha256 below is a placeholder and matches
+#~ nothing — do not publish this copy.
+#~
+#~ `build-app.py --dmg` writes the real one to `target/stereoscopic-converter.rb`
+#~ with the version and digest of the image it just built already substituted.
+#~ That is the file to copy into the tap. Filling the digest in by hand is how a
+#~ cask ends up pinning the wrong bytes.
 cask "stereoscopic-converter" do
   version "0.1.0"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"

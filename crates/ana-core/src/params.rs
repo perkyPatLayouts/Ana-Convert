@@ -18,6 +18,14 @@ use crate::packed::StereoPacking;
 use crate::restore::ColourRestore;
 use crate::transfer::TransferFunction;
 
+/// The largest frame edge the pipeline will accept, in pixels.
+///
+/// Comfortably past anything real — a 16K stereo pair packed side by side is
+/// 30720 wide — but small enough that a frame's sample count cannot come near
+/// overflowing a `usize`. Without a bound somewhere, dimensions taken from a
+/// file's own metadata or from a preset go straight into buffer arithmetic.
+pub const MAX_DIMENSION: usize = 32768;
+
 /// Which eye, if any, is supplied by a separate 2D release instead of being
 /// recovered from the anaglyph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +273,8 @@ pub enum ParamsError {
     },
     #[error("output size must be non-zero in both dimensions, got {0}x{1}")]
     EmptyOutputSize(usize, usize),
+    #[error("output size must be at most {MAX_DIMENSION} in each dimension, got {0}x{1}")]
+    OutputSizeTooLarge(usize, usize),
 }
 
 impl ConvertParams {
@@ -406,6 +416,9 @@ impl ConvertParams {
         if let Some((w, h)) = self.output_size {
             if w == 0 || h == 0 {
                 return Err(ParamsError::EmptyOutputSize(w, h));
+            }
+            if w > MAX_DIMENSION || h > MAX_DIMENSION {
+                return Err(ParamsError::OutputSizeTooLarge(w, h));
             }
         }
         Ok(())
@@ -811,6 +824,31 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(p.validate(), Err(ParamsError::EmptyOutputSize(1920, 0)));
+    }
+
+    #[test]
+    fn an_absurd_output_dimension_is_rejected() {
+        // A size this large is not a frame anyone wants; it is a number that
+        // reaches buffer arithmetic. Refusing it here is the whole defence,
+        // since a preset is just a file and can say anything.
+        let p = ConvertParams {
+            output_size: Some((usize::MAX, 1080)),
+            ..Default::default()
+        };
+        assert_eq!(
+            p.validate(),
+            Err(ParamsError::OutputSizeTooLarge(usize::MAX, 1080))
+        );
+    }
+
+    #[test]
+    fn the_largest_allowed_output_size_is_accepted() {
+        // The bound has to sit above anything real, or it becomes the bug.
+        let p = ConvertParams {
+            output_size: Some((MAX_DIMENSION, MAX_DIMENSION)),
+            ..Default::default()
+        };
+        assert_eq!(p.validate(), Ok(()));
     }
 
     #[test]

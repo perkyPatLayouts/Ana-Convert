@@ -17,7 +17,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 
 use ana_core::FrameF32;
 
-use crate::{FfmpegTools, MediaError};
+use crate::{file_arg, FfmpegTools, MediaError};
 
 /// Which encoder to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -154,7 +154,7 @@ impl Encoder {
         ]);
 
         if let Some(audio) = &settings.audio_from {
-            command.arg("-i").arg(audio).args([
+            command.arg("-i").arg(file_arg(audio)).args([
                 "-map",
                 "0:v:0",
                 "-map",
@@ -179,7 +179,7 @@ impl Encoder {
             .args(["-c:v", settings.codec.ffmpeg_name()])
             .args(settings.codec.quality_args(settings.quality))
             .args(["-pix_fmt", settings.codec.output_pix_fmt()])
-            .arg(path);
+            .arg(file_arg(path));
 
         let mut child = command
             .stdin(Stdio::piped())
@@ -464,6 +464,50 @@ mod tests {
         encoder.finish().expect("finish");
 
         assert!(!probe(&t, &out).expect("probe").has_audio);
+    }
+
+    #[test]
+    fn an_audio_source_is_never_taken_as_an_ffmpeg_protocol() {
+        // The audio source is an ffmpeg input like any other, so it needs the
+        // same protection from protocol prefixes as the video does.
+        let t = tools();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = dir.path().join("source.mp4");
+        let out = dir.path().join("out.mp4");
+        make_test_clip(&t, &source, 32, 32, 10, 10.0);
+
+        let disguised = PathBuf::from(format!("cache:file:{}", source.display()));
+        let mut encoder = Encoder::create(
+            &t,
+            &out,
+            32,
+            32,
+            &EncodeSettings {
+                audio_from: Some(disguised),
+                ..settings()
+            },
+        )
+        .expect("create");
+        let wrote = encoder.write_frame(&solid(32, 32, [0.5, 0.5, 0.5]));
+        assert!(
+            wrote.is_err() || encoder.finish().is_err(),
+            "the cache: protocol was resolved instead of looking for a file of that name"
+        );
+    }
+
+    #[test]
+    fn a_path_containing_a_colon_can_still_be_written() {
+        let t = tools();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let out = dir.path().join("my:film.mkv");
+
+        let mut encoder = Encoder::create(&t, &out, 32, 32, &settings()).expect("create");
+        encoder
+            .write_frame(&solid(32, 32, [0.5, 0.5, 0.5]))
+            .expect("write");
+        encoder.finish().expect("finish");
+
+        assert!(out.exists(), "{} was not written", out.display());
     }
 
     #[test]

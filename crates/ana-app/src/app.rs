@@ -390,6 +390,10 @@ impl AnaApp {
             self.problem = Some(e.to_string());
             return;
         }
+        let occupied = existing_outputs(&job.output, job.params.layout);
+        if !occupied.is_empty() && !confirm_overwrite(&occupied) {
+            return;
+        }
         self.outcome = None;
         self.problem = None;
         self.running = Some(RunningRender::start(tools, job));
@@ -1682,9 +1686,8 @@ impl AnaApp {
         };
         match std::fs::read_to_string(&path)
             .map_err(|e| e.to_string())
-            .and_then(|text| {
-                serde_json::from_str::<ConvertParams>(&text).map_err(|e| e.to_string())
-            }) {
+            .and_then(|text| read_preset(&text))
+        {
             Ok(params) => {
                 self.params = params;
                 self.problem = None;
@@ -1710,6 +1713,56 @@ impl AnaApp {
             Err(e) => self.problem = Some(format!("{}: {e}", path.display())),
         }
     }
+}
+
+/// The files a conversion is about to write that are already there.
+///
+/// The save dialog asks about the name it was given, and nothing else. With
+/// separate streams the names actually written are derived from it, so those
+/// are the ones a user never gets asked about.
+fn existing_outputs(output: &Path, layout: OutputLayout) -> Vec<PathBuf> {
+    output_paths(output, layout)
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect()
+}
+
+/// Asks before writing over films that are already there. True to go ahead.
+///
+/// A conversion is measured in hours, and the file it lands on may be the
+/// result of the last one.
+fn confirm_overwrite(occupied: &[PathBuf]) -> bool {
+    let names = occupied
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let subject = if occupied.len() == 1 {
+        "This file already exists"
+    } else {
+        "These files already exist"
+    };
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("Overwrite?")
+        .set_description(format!(
+            "{subject} and converting will replace it:\n\n{names}"
+        ))
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .show()
+        == rfd::MessageDialogResult::Yes
+}
+
+/// Parses a preset's text into settings, refusing any the pipeline would not
+/// accept.
+///
+/// The render validates too, but far too late: everything between loading a
+/// preset and pressing Convert — every preview, every slider read — would have
+/// been running on whatever the file happened to say.
+fn read_preset(text: &str) -> Result<ConvertParams, String> {
+    let params: ConvertParams = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    params.validate().map_err(|e| e.to_string())?;
+    Ok(params)
 }
 
 fn pick_video() -> Option<PathBuf> {
@@ -1989,6 +2042,77 @@ mod tests {
                 "{name} should be ignored"
             );
         }
+    }
+
+    #[test]
+    fn nothing_is_reported_when_the_destination_is_free() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let out = dir.path().join("film.mkv");
+        assert!(existing_outputs(&out, OutputLayout::SideBySide).is_empty());
+    }
+
+    #[test]
+    fn an_occupied_destination_is_reported() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let out = dir.path().join("film.mkv");
+        std::fs::write(&out, b"an earlier conversion").expect("write");
+        assert_eq!(
+            existing_outputs(&out, OutputLayout::SideBySide),
+            vec![out.clone()]
+        );
+    }
+
+    #[test]
+    fn the_derived_per_eye_names_are_checked_too() {
+        // The gap this closes: with separate streams the save dialog only ever
+        // showed the user `film.mkv`, so macOS asked about that name and about
+        // nothing else. The files actually written are `film-left.mkv` and
+        // `film-right.mkv`, and they were being overwritten in silence.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let out = dir.path().join("film.mkv");
+        let left = dir.path().join("film-left.mkv");
+        std::fs::write(&left, b"an earlier conversion").expect("write");
+
+        assert_eq!(
+            existing_outputs(&out, OutputLayout::Separate),
+            vec![left],
+            "the left eye is about to be overwritten and must be named"
+        );
+    }
+
+    #[test]
+    fn a_usable_preset_is_read_back() {
+        let json = serde_json::to_string(&ConvertParams {
+            leak_correct_left: 12.0,
+            ..Default::default()
+        })
+        .expect("serialise");
+        assert_eq!(
+            read_preset(&json).expect("should load").leak_correct_left,
+            12.0
+        );
+    }
+
+    #[test]
+    fn a_preset_holding_impossible_settings_is_refused_at_the_door() {
+        // A preset is just a file, and one edited by hand or fetched from
+        // somewhere can hold anything. The render checks its settings, but the
+        // preview would have been driving on them long before that.
+        let json = serde_json::to_string(&ConvertParams {
+            output_size: Some((usize::MAX, 1080)),
+            ..Default::default()
+        })
+        .expect("serialise");
+        let err = read_preset(&json).expect_err("should be refused");
+        assert!(
+            err.contains("output size"),
+            "the message must say what is wrong, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_preset_that_is_not_json_is_refused() {
+        assert!(read_preset("not a preset at all").is_err());
     }
 
     #[test]

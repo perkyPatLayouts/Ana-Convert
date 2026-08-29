@@ -1,0 +1,67 @@
+# Every check that can run without a person watching.
+#
+# macOS on Apple Silicon because that is what the app targets: the VideoToolbox
+# encoders and the packaging step exist nowhere else, and ffmpeg is a hard
+# requirement of the media tests, which generate their own fixtures rather than
+# committing binary clips.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Advisories land against dependencies that have not changed, so the audit
+  # needs to run on a clock rather than only on a commit.
+  schedule:
+    - cron: "0 7 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  bundle:
+    # The packaging script is the only thing that checks the app is
+    # self-contained, signed, and cannot have code injected into it. None of
+    # that is exercised by the test suite.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and verify the bundle
+        # Not --dmg: signing and self-containment are the point, and hdiutil on
+        # a runner is slow enough to not be worth it on every push.
+        run: python3 packaging/build-app.py --verify
