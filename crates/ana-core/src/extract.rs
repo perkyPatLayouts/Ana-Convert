@@ -413,6 +413,36 @@ mod tests {
     }
 
     #[test]
+    fn red_blue_and_colorcode_write_the_same_pixels() {
+        // Surprising enough to be worth stating outright, because it looks like
+        // a bug from the outside: choose either in the preview and the picture
+        // does not change.
+        //
+        // Both put the left eye's red and green in the red and green channels
+        // and the right eye's blue in blue. Red/blue reads only the red channel
+        // back, so its green is a free channel that happens to be filled the
+        // same way; ColorCode reads red and green together through amber. The
+        // encodings coincide, the projections do not — which is why the two
+        // formats recover differently from the same file.
+        //
+        // If the ColorCode encoding is ever changed to something truer to the
+        // format, this test should fail and be deleted rather than adjusted.
+        let (left, right) = pair();
+        let red_blue = encode_anaglyph(&left, &right, AnaglyphFormat::RedBlue);
+        let colorcode = encode_anaglyph(&left, &right, AnaglyphFormat::ColorCode);
+        assert_eq!(red_blue.as_slice(), colorcode.as_slice());
+
+        // And the half that does differ: what each one reads back out.
+        let (rb_left, _) = projections(AnaglyphFormat::RedBlue);
+        let (cc_left, _) = projections(AnaglyphFormat::ColorCode);
+        assert_ne!(
+            (rb_left.r, rb_left.g),
+            (cc_left.r, cc_left.g),
+            "the two formats must at least disagree about how to read the file"
+        );
+    }
+
+    #[test]
     fn every_projection_weights_sum_to_one() {
         // Restoration divides by a projected reference value, and both
         // reconstructions only stay exact if a neutral grey projects to itself.

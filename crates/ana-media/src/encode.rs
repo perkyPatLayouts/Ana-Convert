@@ -39,6 +39,51 @@ pub enum VideoCodec {
     ProRes,
 }
 
+/// Which ProRes profile to write.
+///
+/// The profile is what carries a ProRes file's rate; there is no quality knob
+/// beside it. They run from a review copy to a master with an alpha channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProResProfile {
+    /// Smallest. For offline review, not for grading.
+    Proxy,
+    /// Light. Still an editing format, still lossy in ways grading will find.
+    Lt,
+    /// The middle of the range.
+    Standard,
+    /// What a master is normally kept at, and the default here.
+    #[default]
+    Hq,
+    /// 4444: higher chroma resolution, and the first profile with alpha.
+    Quad,
+}
+
+impl ProResProfile {
+    pub const ALL: [ProResProfile; 5] =
+        [Self::Proxy, Self::Lt, Self::Standard, Self::Hq, Self::Quad];
+
+    /// The number `prores_ks` wants.
+    fn number(self) -> u8 {
+        match self {
+            Self::Proxy => 0,
+            Self::Lt => 1,
+            Self::Standard => 2,
+            Self::Hq => 3,
+            Self::Quad => 4,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Proxy => "Proxy",
+            Self::Lt => "LT",
+            Self::Standard => "Standard",
+            Self::Hq => "HQ",
+            Self::Quad => "4444",
+        }
+    }
+}
+
 impl VideoCodec {
     /// The ffmpeg encoder name.
     pub fn ffmpeg_name(self) -> &'static str {
@@ -65,6 +110,14 @@ impl VideoCodec {
         }
     }
 
+    /// True where a bitrate is a meaningful thing to ask for.
+    ///
+    /// ProRes rate comes from the profile, so a bitrate beside it would either
+    /// be ignored or quietly argue with it.
+    fn takes_a_bitrate(self) -> bool {
+        self != Self::ProRes
+    }
+
     /// Quality arguments for a 0..=100 perceptual quality setting.
     fn quality_args(self, quality: u8) -> Vec<String> {
         let quality = quality.min(100);
@@ -79,18 +132,62 @@ impl VideoCodec {
             Self::H264VideoToolbox | Self::HevcVideoToolbox => {
                 vec!["-q:v".into(), quality.max(1).to_string()]
             }
-            // 3 is the HQ profile; quality is carried by the profile, not a knob.
-            Self::ProRes => vec!["-profile:v".into(), "3".into()],
+            // Quality is carried by the profile, not by a knob beside it.
+            Self::ProRes => Vec::new(),
         }
     }
+}
+
+/// The arguments describing the video encode, with no input or output among
+/// them.
+///
+/// Built apart from the process that runs them so what reaches ffmpeg can be
+/// asserted on directly, the way probing keeps its parsing separate from its
+/// process.
+fn video_args(settings: &EncodeSettings) -> Vec<String> {
+    let codec = settings.codec;
+    let mut args = vec!["-c:v".into(), codec.ffmpeg_name().into()];
+
+    // A bitrate and a quality are two ways of asking for the same thing, and
+    // sending both leaves the encoder to choose between them. Asking for one
+    // means the other is not sent.
+    match settings.bitrate_kbps {
+        Some(kbps) if codec.takes_a_bitrate() => {
+            args.extend(["-b:v".into(), format!("{kbps}k")]);
+        }
+        _ => args.extend(codec.quality_args(settings.quality)),
+    }
+
+    if codec == VideoCodec::ProRes {
+        args.extend([
+            "-profile:v".into(),
+            settings.prores_profile.number().to_string(),
+        ]);
+    }
+
+    if let Some(frames) = settings.keyframe_interval {
+        args.extend(["-g".into(), frames.to_string()]);
+    }
+
+    args.extend(["-pix_fmt".into(), codec.output_pix_fmt().into()]);
+    args
 }
 
 /// How to write the output file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncodeSettings {
     pub codec: VideoCodec,
-    /// Perceptual quality, 0..=100.
+    /// Perceptual quality, 0..=100. Ignored when a bitrate is set.
     pub quality: u8,
+    /// A fixed video bitrate in kbit/s, for delivery to something that needs a
+    /// known size. `None` — the default — lets quality decide, which is the
+    /// better answer whenever the size is not the constraint.
+    pub bitrate_kbps: Option<u32>,
+    /// Frames between keyframes. `None` leaves the encoder's own choice alone.
+    /// Shorter means more seekable and larger.
+    pub keyframe_interval: Option<u32>,
+    /// Which ProRes profile to write. Ignored by every other codec.
+    pub prores_profile: ProResProfile,
     pub fps: f64,
     /// File to copy an audio track from, if any.
     pub audio_from: Option<PathBuf>,
@@ -107,6 +204,9 @@ impl Default for EncodeSettings {
         Self {
             codec: VideoCodec::default(),
             quality: 75,
+            bitrate_kbps: None,
+            keyframe_interval: None,
+            prores_profile: ProResProfile::default(),
             fps: 24.0,
             audio_from: None,
             display_aspect: None,
@@ -175,11 +275,7 @@ impl Encoder {
             }
         }
 
-        command
-            .args(["-c:v", settings.codec.ffmpeg_name()])
-            .args(settings.codec.quality_args(settings.quality))
-            .args(["-pix_fmt", settings.codec.output_pix_fmt()])
-            .arg(file_arg(path));
+        command.args(video_args(settings)).arg(file_arg(path));
 
         let mut child = command
             .stdin(Stdio::piped())
@@ -297,6 +393,99 @@ mod tests {
             fps: 10.0,
             ..Default::default()
         }
+    }
+
+    /// The arguments as one string, for asserting on what reaches ffmpeg.
+    fn args_for(settings: &EncodeSettings) -> String {
+        video_args(settings).join(" ")
+    }
+
+    #[test]
+    fn quality_is_the_default_rate_control() {
+        let args = args_for(&EncodeSettings {
+            codec: VideoCodec::H264,
+            quality: 100,
+            ..Default::default()
+        });
+        assert!(args.contains("-crf 14"), "got {args}");
+        assert!(
+            !args.contains("-b:v"),
+            "a bitrate was set without being asked for"
+        );
+    }
+
+    #[test]
+    fn a_bitrate_replaces_the_quality_setting() {
+        // The two are different ways of asking for the same thing, and passing
+        // both lets the encoder pick — so choosing one has to mean the other
+        // is not sent at all.
+        let args = args_for(&EncodeSettings {
+            codec: VideoCodec::H264,
+            bitrate_kbps: Some(4500),
+            ..Default::default()
+        });
+        assert!(args.contains("-b:v 4500k"), "got {args}");
+        assert!(
+            !args.contains("-crf"),
+            "quality was sent alongside a bitrate: {args}"
+        );
+    }
+
+    #[test]
+    fn a_keyframe_interval_reaches_ffmpeg() {
+        let args = args_for(&EncodeSettings {
+            keyframe_interval: Some(48),
+            ..Default::default()
+        });
+        assert!(args.contains("-g 48"), "got {args}");
+    }
+
+    #[test]
+    fn no_keyframe_interval_leaves_the_encoder_to_decide() {
+        assert!(!args_for(&EncodeSettings::default()).contains("-g "));
+    }
+
+    #[test]
+    fn the_prores_profile_is_chosen_rather_than_fixed() {
+        for (profile, number) in [
+            (ProResProfile::Proxy, "0"),
+            (ProResProfile::Lt, "1"),
+            (ProResProfile::Standard, "2"),
+            (ProResProfile::Hq, "3"),
+            (ProResProfile::Quad, "4"),
+        ] {
+            let args = args_for(&EncodeSettings {
+                codec: VideoCodec::ProRes,
+                prores_profile: profile,
+                ..Default::default()
+            });
+            assert!(
+                args.contains(&format!("-profile:v {number}")),
+                "{profile:?} should be profile {number}, got {args}"
+            );
+        }
+    }
+
+    #[test]
+    fn prores_ignores_a_bitrate() {
+        // ProRes rate is carried by the profile. Sending a bitrate as well
+        // would either be ignored or quietly fight the profile.
+        let args = args_for(&EncodeSettings {
+            codec: VideoCodec::ProRes,
+            bitrate_kbps: Some(4500),
+            ..Default::default()
+        });
+        assert!(!args.contains("-b:v"), "got {args}");
+    }
+
+    #[test]
+    fn the_defaults_are_what_the_app_shipped_with() {
+        // The dialog exists to be ignored: someone who never opens it must get
+        // exactly the encode they got before it was added.
+        let args = args_for(&EncodeSettings::default());
+        assert!(args.contains("-c:v h264_videotoolbox"), "got {args}");
+        assert!(args.contains("-q:v 75"), "got {args}");
+        assert!(args.contains("-pix_fmt yuv420p"), "got {args}");
     }
 
     #[test]
@@ -508,6 +697,75 @@ mod tests {
         encoder.finish().expect("finish");
 
         assert!(out.exists(), "{} was not written", out.display());
+    }
+
+    #[test]
+    fn every_prores_profile_is_one_ffmpeg_accepts() {
+        // The argument tests prove which number is sent, not that the number
+        // means anything. A profile ffmpeg rejects fails the whole encode.
+        let t = tools();
+        let dir = tempfile::tempdir().expect("temp dir");
+        for profile in ProResProfile::ALL {
+            let out = dir.path().join(format!("{}.mov", profile.label()));
+            let mut encoder = Encoder::create(
+                &t,
+                &out,
+                64,
+                48,
+                &EncodeSettings {
+                    codec: VideoCodec::ProRes,
+                    prores_profile: profile,
+                    ..settings()
+                },
+            )
+            .expect("create");
+            encoder
+                .write_frame(&solid(64, 48, [0.4, 0.6, 0.8]))
+                .expect("write");
+            encoder
+                .finish()
+                .unwrap_or_else(|e| panic!("{} was refused: {e}", profile.label()));
+            assert!(out.exists(), "{} wrote nothing", profile.label());
+        }
+    }
+
+    #[test]
+    fn a_bitrate_actually_changes_the_size_of_the_file() {
+        // That the flag reaches ffmpeg is one thing; that ffmpeg does something
+        // with it is another.
+        let t = tools();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut sizes = Vec::new();
+        for (name, kbps) in [("low.mp4", 100u32), ("high.mp4", 8000)] {
+            let out = dir.path().join(name);
+            let mut encoder = Encoder::create(
+                &t,
+                &out,
+                320,
+                240,
+                &EncodeSettings {
+                    codec: VideoCodec::H264,
+                    bitrate_kbps: Some(kbps),
+                    ..settings()
+                },
+            )
+            .expect("create");
+            for i in 0..30 {
+                let v = (i % 7) as f32 / 7.0;
+                encoder
+                    .write_frame(&solid(320, 240, [v, 1.0 - v, 0.5]))
+                    .expect("write");
+            }
+            encoder.finish().expect("finish");
+            sizes.push(out.metadata().expect("size").len());
+        }
+        assert!(
+            sizes[0] < sizes[1],
+            "100 kbit/s produced {} bytes and 8000 kbit/s produced {} — the \
+             bitrate is not reaching the encoder",
+            sizes[0],
+            sizes[1]
+        );
     }
 
     #[test]

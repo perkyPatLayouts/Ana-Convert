@@ -9,7 +9,7 @@
 //! what the pane shows is the conversion itself, not an approximation of it.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ana_core::compose::{EyeOrder, OutputLayout};
 use ana_core::extract::AnaglyphFormat;
@@ -19,8 +19,8 @@ use ana_core::restore::ColourRestore;
 use ana_core::timecode::format_timecode;
 use ana_core::transfer::TransferFunction;
 use ana_core::FrameF32;
-use ana_media::encode::{EncodeSettings, VideoCodec};
-use ana_media::{grab_frame, locate, probe, FfmpegTools, VideoInfo};
+use ana_media::encode::{EncodeSettings, ProResProfile, VideoCodec};
+use ana_media::{grab_frame, locate, probe, FfmpegTools, ToolSource, VideoInfo};
 use ana_pipeline::{output_paths, RenderJob};
 
 use crate::preview::{scale_params_for_preview, PreviewCache, PreviewWork};
@@ -31,6 +31,20 @@ use crate::view::{compose_view, ViewMode};
 /// blends neighbouring pixels, which mixes the two eyes together, so too small
 /// a preview stops representing the conversion at all.
 const MIN_PREVIEW_SCALE: f32 = 0.25;
+
+/// What the app calls itself, everywhere it says so.
+pub const APP_NAME: &str = "Stereoscopic Converter";
+
+/// Taken from the crate rather than written out, so About, `--version`, the
+/// disk image and the Homebrew cask cannot drift apart.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Width kept back from the frame scrubber for its value box and its "Frame"
+/// label, both of which egui lays out to the right of the track.
+const SCRUBBER_LABEL_ROOM: f32 = 110.0;
+
+/// The scrubber never shrinks below this, however little room is left.
+const SCRUBBER_MIN_WIDTH: f32 = 120.0;
 
 /// One source file and what we know about it.
 struct Source {
@@ -49,6 +63,8 @@ struct Decoded {
 
 pub struct AnaApp {
     tools: Result<FfmpegTools, String>,
+    /// Where those tools came from, so About can say so honestly.
+    tool_source: Option<ToolSource>,
 
     anaglyph: Option<Source>,
     /// The 2D release, if there is one. One file serving both purposes, because
@@ -65,10 +81,22 @@ pub struct AnaApp {
     encode: EncodeSettings,
 
     frame: u64,
+    /// Running the preview forward on its own.
+    ///
+    /// Playback reuses the preview's decode path, which spends an ffmpeg launch
+    /// per frame — around 80 ms at 1080p — so this runs as fast as it decodes
+    /// rather than at the film's rate. Real-time would want a decoder held open
+    /// across frames, which is a different piece of work.
+    playing: bool,
+    /// When the last frame was stepped, so playback cannot outrun the source.
+    last_advance: Instant,
     /// Independent position in a secondary source, used only while aligning.
     align_frame: u64,
     aligning: Option<Role>,
     view: ViewMode,
+    /// Which anaglyph encoding the Anaglyph view shows. A preview choice only:
+    /// it changes nothing about the conversion.
+    preview_format: AnaglyphFormat,
     cache: PreviewCache,
     decoded: Decoded,
     pair: Option<StereoPair>,
@@ -76,7 +104,15 @@ pub struct AnaApp {
     last_process: Option<f32>,
     preview_scale: f32,
 
+    /// Whether the source's audio is carried into the output.
+    ///
+    /// Kept beside the path rather than folded into it, so turning audio off
+    /// and on again does not lose which file it was coming from.
+    audio_enabled: bool,
+
     help_open: bool,
+    encoding_open: bool,
+    about_open: bool,
     running: Option<RunningRender>,
     outcome: Option<String>,
     problem: Option<String>,
@@ -117,8 +153,13 @@ impl AnaApp {
             style.spacing.item_spacing = egui::vec2(8.0, 6.0);
             style.spacing.button_padding = egui::vec2(9.0, 5.0);
         });
+        let located = locate(None).map_err(|e| e.to_string());
         let mut app = Self {
-            tools: locate(None).map(|(t, _)| t).map_err(|e| e.to_string()),
+            tools: located
+                .as_ref()
+                .map(|(t, _)| t.clone())
+                .map_err(|e| e.clone()),
+            tool_source: located.as_ref().ok().map(|(_, source)| *source),
             anaglyph: None,
             secondary: None,
             secondary_role: SecondaryRole::default(),
@@ -128,16 +169,22 @@ impl AnaApp {
             params: ConvertParams::default(),
             encode: EncodeSettings::default(),
             frame: 0,
+            playing: false,
+            last_advance: Instant::now(),
             align_frame: 0,
             aligning: None,
             view: ViewMode::default(),
+            preview_format: AnaglyphFormat::default(),
             cache: PreviewCache::new(),
             decoded: Decoded::default(),
             pair: None,
             texture: None,
             last_process: None,
             preview_scale: 1.0,
+            audio_enabled: true,
             help_open: false,
+            encoding_open: false,
+            about_open: false,
             running: None,
             outcome: None,
             problem: None,
@@ -230,7 +277,18 @@ impl AnaApp {
 
         let preview_params = self.preview_params();
         match self.cache.work_for(self.frame, &preview_params) {
-            PreviewWork::Nothing => return,
+            PreviewWork::Nothing => {
+                // Nothing to convert again — but the texture is built from the
+                // view as well as from the pair, and the cache knows only about
+                // the frame and the conversion settings. Changing view drops the
+                // texture without changing either, so rebuild it from the pair
+                // already in hand; otherwise the pane falls back to its empty
+                // state and tells someone with a film open to open a film.
+                if self.texture.is_none() {
+                    self.upload(ctx);
+                }
+                return;
+            }
             PreviewWork::DecodeAndProcess => {
                 if let Err(e) = self.decode_current(tools.clone()) {
                     self.problem = Some(e);
@@ -342,12 +400,7 @@ impl AnaApp {
 
     fn upload(&mut self, ctx: &egui::Context) {
         let Some(pair) = &self.pair else { return };
-        let image = compose_view(
-            pair,
-            self.view,
-            self.params.input_format,
-            self.params.eye_order,
-        );
+        let image = compose_view(pair, self.view, self.preview_format, self.params.eye_order);
         let rgb = image.to_rgb8();
         let colour = egui::ColorImage::from_rgb([image.width(), image.height()], &rgb);
         self.texture = Some(ctx.load_texture("preview", colour, egui::TextureOptions::LINEAR));
@@ -367,7 +420,7 @@ impl AnaApp {
                 .supplies_an_eye()
                 .then(|| secondary.clone())
                 .flatten(),
-            audio: self.audio.clone(),
+            audio: self.audio_enabled.then(|| self.audio.clone()).flatten(),
             output: self.output.clone()?,
             params: self.effective_params(),
             encode: EncodeSettings {
@@ -616,10 +669,13 @@ fn output_format_hint(format: AnaglyphFormat) -> &'static str {
         }
         AnaglyphFormat::ColorCode => {
             "Amber and blue. The amber eye keeps nearly all the brightness and colour; \
-             the blue eye is dim, and carries little more than the parallax."
+             the blue eye is dim, and carries little more than the parallax. \
+             Writes the same pixels as red/blue — the difference is in how the \
+             glasses read them back, not in the file."
         }
         AnaglyphFormat::RedBlue => {
-            "The oldest arrangement. Poor colour, but very forgiving glasses."
+            "The oldest arrangement. Poor colour, but very forgiving glasses. \
+             Writes the same pixels as ColorCode; only the reading differs."
         }
     }
 }
@@ -847,6 +903,8 @@ impl eframe::App for AnaApp {
 
         self.take_dropped_files(&ctx);
         self.help_window(&ctx);
+        self.encoding_window(&ctx);
+        self.about_window(&ctx);
         self.top_bar(ui);
         self.side_panel(ui);
         self.bottom_bar(ui);
@@ -932,6 +990,9 @@ impl AnaApp {
                 if ui.selectable_label(self.help_open, "Help").clicked() {
                     self.help_open = !self.help_open;
                 }
+                if ui.selectable_label(self.about_open, "About").clicked() {
+                    self.about_open = !self.about_open;
+                }
             });
 
             if let Err(message) = &self.tools {
@@ -985,6 +1046,12 @@ impl AnaApp {
         egui::Panel::right("params")
             .default_size(340.0)
             .show(ui, |ui| {
+                // A solid scrollbar rather than the default floating one. The
+                // column is taller than a short screen can show, and a floating
+                // bar in this dark theme is a two-pixel line that fades — no
+                // cue at all that the Destination section is below the fold.
+                // Solid reserves its width and stays put.
+                ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
@@ -1292,26 +1359,228 @@ impl AnaApp {
         }
 
         ui.add_space(6.0);
-        egui::ComboBox::from_label("Codec")
-            .selected_text(codec_name(self.encode.codec))
-            .show_ui(ui, |ui| {
-                for c in [
-                    VideoCodec::H264VideoToolbox,
-                    VideoCodec::HevcVideoToolbox,
-                    VideoCodec::H264,
-                    VideoCodec::Hevc,
-                    VideoCodec::ProRes,
-                ] {
-                    ui.selectable_value(&mut self.encode.codec, c, codec_name(c));
-                }
-            });
-        ui.add(egui::Slider::new(&mut self.encode.quality, 0..=100).text("Quality"));
+        // A summary and a way in, rather than the whole encoder on the panel.
+        // Most conversions never need any of it, and the ones that do need
+        // more of it than fits here.
+        ui.label(egui::RichText::new(self.encoding_summary()).weak());
+        if ui
+            .button("Encoding settings…")
+            .on_hover_text("Codec, rate, keyframes and what happens to the audio.")
+            .clicked()
+        {
+            self.encoding_open = true;
+        }
 
         ui.add_space(8.0);
         if ui.button("Reset all settings").clicked() {
             self.params = ConvertParams::default();
             self.cache.invalidate();
         }
+    }
+
+    /// What this is, what version, and what it is built on.
+    fn about_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.about_open;
+        egui::Window::new("About")
+            .open(&mut open)
+            .default_width(400.0)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(APP_NAME)
+                        .strong()
+                        .size(19.0)
+                        .color(SECTION_COLOUR),
+                );
+                ui.label(egui::RichText::new(format!("Version {VERSION} Beta")).strong());
+                ui.add_space(8.0);
+                ui.label(
+                    "Recovers full-colour stereo video from anaglyph 3D, and converts \
+                     between every common stereo layout.",
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Free software under the GPL-3.0-or-later. It reimplements the \
+                         AviSynth AnaExtract scripts published at vrtifacts.com.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                ui.add_space(6.0);
+                // Where ffmpeg came from, told accurately: a shipped bundle
+                // carries its own, but a development build is usually running
+                // against whatever Homebrew installed, and claiming otherwise
+                // in an About window would be a small lie.
+                ui.label(
+                    egui::RichText::new(match (&self.tools, self.tool_source) {
+                        (Ok(tools), Some(ToolSource::Bundled)) => {
+                            format!(
+                                "Bundles FFmpeg, also under the GPL:\n{}",
+                                tools.ffmpeg.display()
+                            )
+                        }
+                        (Ok(tools), _) => {
+                            format!("Using the FFmpeg found at\n{}", tools.ffmpeg.display())
+                        }
+                        (Err(e), _) => format!("FFmpeg was not found: {e}"),
+                    })
+                    .weak()
+                    .small(),
+                );
+                ui.add_space(4.0);
+            });
+        self.about_open = open;
+    }
+
+    /// One line describing what the encoder will do, for the panel.
+    fn encoding_summary(&self) -> String {
+        let rate = match (self.encode.codec, self.encode.bitrate_kbps) {
+            (VideoCodec::ProRes, _) => self.encode.prores_profile.label().to_string(),
+            (_, Some(kbps)) => format!("{kbps} kbit/s"),
+            (_, None) => format!("quality {}", self.encode.quality),
+        };
+        let audio = if self.audio_enabled && self.audio.is_some() {
+            "audio kept"
+        } else {
+            "no audio"
+        };
+        format!("{} · {rate} · {audio}", codec_name(self.encode.codec))
+    }
+
+    /// Everything about how the file is written.
+    fn encoding_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.encoding_open;
+        egui::Window::new("Encoding settings")
+            .open(&mut open)
+            .default_width(430.0)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                Self::section(ui, "Video");
+                egui::ComboBox::from_label("Codec")
+                    .selected_text(codec_name(self.encode.codec))
+                    .show_ui(ui, |ui| {
+                        for c in [
+                            VideoCodec::H264VideoToolbox,
+                            VideoCodec::HevcVideoToolbox,
+                            VideoCodec::H264,
+                            VideoCodec::Hevc,
+                            VideoCodec::ProRes,
+                        ] {
+                            ui.selectable_value(&mut self.encode.codec, c, codec_name(c))
+                                .on_hover_text(codec_hint(c));
+                        }
+                    });
+
+                if self.encode.codec == VideoCodec::ProRes {
+                    // ProRes carries its rate in the profile, so neither the
+                    // quality nor the bitrate below would mean anything.
+                    egui::ComboBox::from_label("Profile")
+                        .selected_text(self.encode.prores_profile.label())
+                        .show_ui(ui, |ui| {
+                            for p in ProResProfile::ALL {
+                                ui.selectable_value(&mut self.encode.prores_profile, p, p.label());
+                            }
+                        });
+                    ui.label(
+                        egui::RichText::new(
+                            "ProRes takes its rate from the profile, so quality and \
+                             bitrate do not apply.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                } else {
+                    let mut fixed_rate = self.encode.bitrate_kbps.is_some();
+                    if ui
+                        .checkbox(&mut fixed_rate, "Fixed bitrate")
+                        .on_hover_text(
+                            "Aim at a size rather than a look. Worth it only when \
+                             something downstream needs a known bitrate — otherwise \
+                             quality gives a better picture for the same file.",
+                        )
+                        .changed()
+                    {
+                        // Remember nothing across the toggle: a bitrate that
+                        // suited one codec rarely suits the next.
+                        self.encode.bitrate_kbps = fixed_rate.then_some(8000);
+                    }
+
+                    match &mut self.encode.bitrate_kbps {
+                        Some(kbps) => {
+                            ui.add(
+                                egui::Slider::new(kbps, 500..=60_000)
+                                    .logarithmic(true)
+                                    .text("kbit/s"),
+                            );
+                        }
+                        None => {
+                            ui.add(
+                                egui::Slider::new(&mut self.encode.quality, 0..=100)
+                                    .text("Quality"),
+                            );
+                        }
+                    }
+                }
+
+                ui.add_space(4.0);
+                let mut keyframes = self.encode.keyframe_interval.is_some();
+                if ui
+                    .checkbox(&mut keyframes, "Set keyframe interval")
+                    .on_hover_text(
+                        "Frames between keyframes. Shorter seeks more precisely and \
+                         costs size; left alone, the encoder decides.",
+                    )
+                    .changed()
+                {
+                    self.encode.keyframe_interval = keyframes.then_some(48);
+                }
+                if let Some(interval) = &mut self.encode.keyframe_interval {
+                    ui.add(egui::Slider::new(interval, 1..=300).text("Frames"));
+                }
+
+                ui.add_space(8.0);
+                Self::section(ui, "Audio");
+                ui.checkbox(&mut self.audio_enabled, "Pass audio through")
+                    .on_hover_text(
+                        "Audio is copied from the source, never re-encoded. The \
+                         conversion has no business touching it.",
+                    );
+
+                ui.add_enabled_ui(self.audio_enabled, |ui| {
+                    let from = match &self.audio {
+                        Some(path) => path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
+                        None => "nothing — the source has no audio track".to_string(),
+                    };
+                    ui.label(egui::RichText::new(format!("From: {from}")).weak());
+                    ui.horizontal(|ui| {
+                        if ui.button("Choose file…").clicked() {
+                            if let Some(path) = pick_video() {
+                                self.audio = Some(path);
+                            }
+                        }
+                        let source = self.anaglyph.as_ref().map(|s| s.path.clone());
+                        let is_source = self.audio == source;
+                        if ui
+                            .add_enabled(
+                                source.is_some() && !is_source,
+                                egui::Button::new("Use the source"),
+                            )
+                            .clicked()
+                        {
+                            self.audio = source;
+                        }
+                    });
+                });
+            });
+        self.encoding_open = open;
     }
 
     /// The manual. Kept in the app because the questions it answers come up
@@ -1529,6 +1798,34 @@ impl AnaApp {
         }
     }
 
+    /// Steps the preview forward while playing.
+    ///
+    /// Decoding is the limit at any real resolution, but a small source or a
+    /// heavily downscaled preview would otherwise run far faster than the film,
+    /// so the source's own rate is the ceiling. Playback stops at the end
+    /// rather than looping: this is for judging a shot, not watching the film.
+    fn advance_playback(&mut self, ctx: &egui::Context, last: u64) {
+        if self.frame >= last {
+            self.playing = false;
+            return;
+        }
+
+        let fps = self
+            .anaglyph
+            .as_ref()
+            .map(|s| s.info.fps)
+            .filter(|fps| *fps > 0.0)
+            .unwrap_or(24.0);
+        let per_frame = Duration::from_secs_f64(1.0 / fps);
+        if self.last_advance.elapsed() >= per_frame {
+            self.frame += 1;
+            self.last_advance = Instant::now();
+        }
+        // Keep the pass loop turning; without this the app sleeps until the
+        // next input event and playback stops after one frame.
+        ctx.request_repaint();
+    }
+
     fn bottom_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("transport").show(ui, |ui| {
             ui.add_space(6.0);
@@ -1540,10 +1837,42 @@ impl AnaApp {
             );
             ui.separator();
             let last = self.frame_count().saturating_sub(1);
-            ui.add_enabled(
-                self.anaglyph.is_some(),
-                egui::Slider::new(&mut self.frame, 0..=last).text("Frame"),
-            );
+            let loaded = self.anaglyph.is_some();
+            ui.horizontal(|ui| {
+                let label = if self.playing { "Pause" } else { "Play" };
+                if ui
+                    .add_enabled(loaded, egui::Button::new(label))
+                    .on_hover_text(
+                        "Run the preview forward. It converts every frame as it goes, \
+                         so it plays as fast as it can rather than at the film's rate.",
+                    )
+                    .clicked()
+                {
+                    self.playing = !self.playing;
+                    // Step on the very next pass rather than waiting out a
+                    // frame's worth of the pacing below.
+                    self.last_advance = Instant::now() - Duration::from_secs(1);
+                }
+
+                // The slider gets the rest of the row. egui lays a Slider's
+                // value box and its text out to the right of the track, so that
+                // much has to be kept back or they are pushed off the edge.
+                ui.spacing_mut().slider_width =
+                    (ui.available_width() - SCRUBBER_LABEL_ROOM).max(SCRUBBER_MIN_WIDTH);
+                let scrubber = ui.add_enabled(
+                    loaded,
+                    egui::Slider::new(&mut self.frame, 0..=last).text("Frame"),
+                );
+                // Taking hold of the scrubber means going somewhere specific;
+                // playback would only drag the frame out from under it.
+                if scrubber.dragged() {
+                    self.playing = false;
+                }
+            });
+
+            if self.playing {
+                self.advance_playback(ui.ctx(), last);
+            }
 
             ui.horizontal_wrapped(|ui| {
                 for mode in ViewMode::ALL {
@@ -1557,6 +1886,27 @@ impl AnaApp {
                         self.texture = None;
                     }
                 }
+
+                // Which anaglyph to look at is a question about the preview
+                // alone. It is deliberately not the source setting and not the
+                // destination one: the point is to see any of the four without
+                // disturbing the conversion.
+                if self.view == ViewMode::Anaglyph {
+                    ui.separator();
+                    let before = self.preview_format;
+                    egui::ComboBox::from_label("Anaglyph mode")
+                        .selected_text(format_name(self.preview_format))
+                        .show_ui(ui, |ui| {
+                            for f in AnaglyphFormat::ALL {
+                                ui.selectable_value(&mut self.preview_format, f, format_name(f))
+                                    .on_hover_text(output_format_hint(f));
+                            }
+                        });
+                    if self.preview_format != before {
+                        self.texture = None;
+                    }
+                }
+
                 ui.separator();
                 if let Some(ms) = self.last_process {
                     ui.label(
@@ -1715,6 +2065,18 @@ impl AnaApp {
     }
 }
 
+/// The window size to open at.
+///
+/// The height is not a taste: it is what the settings column needs to arrive
+/// whole, and `settings_column_fits` holds it to that. Asking for less does not
+/// make the window smaller on a short screen — the viewport is clamped to the
+/// monitor either way — it only cuts the bottom off the column on a tall one.
+pub const STARTUP_WINDOW: egui::Vec2 = egui::vec2(1380.0, 1440.0);
+
+/// The smallest window worth opening. Below this the layout stops being usable
+/// rather than merely cramped.
+pub const MINIMUM_WINDOW: egui::Vec2 = egui::vec2(1000.0, 700.0);
+
 /// The files a conversion is about to write that are already there.
 ///
 /// The save dialog asks about the name it was given, and nothing else. With
@@ -1824,7 +2186,24 @@ fn codec_name(c: VideoCodec) -> &'static str {
         VideoCodec::HevcVideoToolbox => "HEVC (hardware)",
         VideoCodec::H264 => "H.264 (software)",
         VideoCodec::Hevc => "HEVC (software)",
-        VideoCodec::ProRes => "ProRes HQ",
+        // No longer HQ by name: the profile is chosen beside it.
+        VideoCodec::ProRes => "ProRes",
+    }
+}
+
+fn codec_hint(c: VideoCodec) -> &'static str {
+    match c {
+        VideoCodec::H264VideoToolbox => {
+            "Fast on Apple Silicon. The sensible default for review copies and \
+             for anything going to a headset."
+        }
+        VideoCodec::HevcVideoToolbox => "Better compression, less universally playable.",
+        VideoCodec::H264 => {
+            "Slower, but identical on every machine — which matters for anything \
+             that has to be reproducible."
+        }
+        VideoCodec::Hevc => "Software HEVC. Slow, and smaller than software H.264.",
+        VideoCodec::ProRes => "For keeping a master to grade or re-encode later. Large.",
     }
 }
 

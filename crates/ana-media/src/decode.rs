@@ -196,9 +196,36 @@ fn apply_seek(command: &mut Command, path: &Path, info: &VideoInfo, index: u64) 
         command.arg("-i").arg(file_arg(path));
         return;
     }
-    let lead_in = 1.0_f64.min(index as f64 / info.fps);
-    let seek_to = (index as f64 / info.fps) - lead_in;
-    let skip = (lead_in * info.fps).round() as u64;
+    // Where the frame sits if frames are spaced evenly from zero.
+    let target = index as f64 / info.fps;
+    let lead_in = 1.0_f64.min(target);
+    let seek_to = target - lead_in;
+    let mut skip = (lead_in * info.fps).round() as u64;
+
+    // A duration runs to the end of the last frame's time on screen, so the
+    // last picture is presented one frame before it.
+    let last_pts = info
+        .duration_secs
+        .map(|duration| (duration - 1.0 / info.fps).max(0.0));
+
+    // Never ask for more frames than are left after the seek.
+    //
+    // `select` counts frames the decoder actually emits, and `skip` assumes a
+    // full second of them follows the seek. At the end of a film it does not:
+    // `index / fps` drifts against the file's own timeline on any fractional
+    // rate — 23.976 and 29.97 both do — until, near the end of a feature, the
+    // computed time is past the last picture and fewer frames remain than
+    // `skip` demands. `select` then matches nothing and hands back an empty
+    // pipe instead of a picture, which is what scrubbing to the end used to do.
+    //
+    // Seeking genuinely past the end still yields nothing, which is what a
+    // sequential decode of a trim beyond the file should do: `seek_to` is
+    // beyond the last frame by then, so this bottoms out at zero and ffmpeg
+    // finds nothing to emit either way.
+    if let Some(last) = last_pts {
+        let last_available = ((last - seek_to) * info.fps).floor().max(0.0) as u64;
+        skip = skip.min(last_available);
+    }
     command
         .args(["-ss", &format!("{seek_to:.6}")])
         .arg("-i")
@@ -463,6 +490,51 @@ mod tests {
 
         let mut decoder = Decoder::open_at(&t, &clip, &info, 500).expect("open");
         assert!(decoder.next_frame().expect("decode").is_none());
+    }
+
+    #[test]
+    fn the_last_frame_of_a_film_can_be_grabbed() {
+        // Scrubbing to the end. A frame's timestamp is worked out as index/fps,
+        // which drifts against the file's own timeline on any fractional rate —
+        // and by the last frame of a feature the drift is enough to put the
+        // computed time past the end of the file. The seek then lands too late
+        // for the frame count that follows it, ffmpeg selects nothing, and the
+        // preview reports that it wanted a frame and got no bytes.
+        let t = tools();
+        let dir = tempfile::tempdir().expect("temp dir");
+        for (frames, fps) in [(20, 10.0), (100, 23.976), (300, 29.97)] {
+            let clip = dir.path().join(format!("clip-{fps}.mp4"));
+            make_test_clip(&t, &clip, 64, 48, frames, fps);
+            let info = probe(&t, &clip).expect("probe");
+            let last = info
+                .estimated_frame_count()
+                .expect("the fixture reports its length")
+                - 1;
+
+            let frame = grab_frame(&t, &clip, &info, last)
+                .unwrap_or_else(|e| panic!("last frame of a {fps} fps film: {e}"));
+            assert_eq!((frame.width(), frame.height()), (64, 48));
+        }
+    }
+
+    #[test]
+    fn the_frames_either_side_of_the_end_still_grab() {
+        // The tail is where the arithmetic runs out, so check a few frames of
+        // it rather than only the very last one.
+        let t = tools();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clip = dir.path().join("tail.mp4");
+        make_test_clip(&t, &clip, 64, 48, 300, 29.97);
+        let info = probe(&t, &clip).expect("probe");
+        let last = info.estimated_frame_count().expect("a frame count") - 1;
+
+        for back in 0..5 {
+            let index = last - back;
+            assert!(
+                grab_frame(&t, &clip, &info, index).is_ok(),
+                "frame {index} of {last} could not be grabbed"
+            );
+        }
     }
 
     #[test]

@@ -28,6 +28,28 @@ How to convert a film, and what every control does.
 Most films need nothing beyond steps 1–2 and 5–6. The defaults are the values
 the original AviSynth post recommends as a starting point.
 
+### Something to practise on
+
+[`docs/sample/stereo-sample-sbs.mp4`](sample/stereo-sample-sbs.mp4) is a
+ten-second side-by-side clip built for exactly this. Open it and set **This file
+holds** to *A stereo pair, side by side*.
+
+It is worth knowing what is in it, because each piece is there to show you
+something:
+
+| In the scene | What it is for |
+|---|---|
+| The yellow post | Sits **exactly on the screen plane** — identical in both eyes. It never moves however you set Convergence, so it is the thing to judge everything else against. |
+| The line of small posts | Each one further away than the last, so you can see depth in steps rather than as a single impression. |
+| The blue card | Drifts along at a constant depth **behind** the screen. Its fringe never changes width. |
+| The red ball | Crosses the frame while moving **towards you**, so its disparity grows as it comes. By the middle of its travel it is far enough forward to fringe badly — and no setting will fix that, which is the honest limit described in [What it cannot do](../README.md#what-it-cannot-do). |
+| The strip along the bottom | A marker that crosses once, with a tick every second. It tells you which frame you are looking at. |
+
+Try converting it to **Anaglyph** first. Every object's depth becomes directly
+visible as the width of its colour fringe, and the post on the screen plane has
+none at all. Then convert that anaglyph back with **This file holds → An
+anaglyph** and compare: most of the scene comes back, and the ball does not.
+
 ### What recovery does
 
 | The anaglyph you start with | One eye, recovered |
@@ -333,5 +355,5 @@ to match before it is much use.
 Leave the audio source unset for a silent film.
 
 **The app cannot find ffmpeg.** Only possible in a development build. Run
-`ana-convert-app --check` to see what it resolved. The bundled `.app` carries
+`"Stereoscopic Converter" --check` to see what it resolved. The bundled `.app` carries
 its own and cannot hit this.

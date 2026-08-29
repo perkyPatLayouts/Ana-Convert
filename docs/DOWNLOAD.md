@@ -22,7 +22,7 @@ brew install --cask --no-quarantine perkypatlayouts/tap/stereoscopic-converter
 
 ## Or download the disk image
 
-**[StereoscopicConverter-0.1.0.dmg](https://github.com/perkyPatLayouts/Ana-Convert/releases/latest)**
+**[StereoscopicConverter-0.10.0.dmg](https://github.com/perkyPatLayouts/Ana-Convert/releases/latest)**
 
 Open it and drag the app to Applications. Then run this once:
 
@@ -41,7 +41,7 @@ being asked to trust the download rather than Apple's check on it, it is worth
 knowing that what arrived is what was built:
 
 ```bash
-shasum -a 256 -c StereoscopicConverter-0.1.0.dmg.sha256
+shasum -a 256 -c StereoscopicConverter-0.10.0.dmg.sha256
 ```
 
 `OK` means the file is byte-for-byte the one released. Anything else — a

@@ -444,6 +444,9 @@ fn do_render(tools: &ana_media::FfmpegTools, args: &RenderArgs) -> Result<ExitCo
             // The pipeline recomputes this from the source; set here only so
             // the struct is complete.
             display_aspect: None,
+            // The finer encoder settings are the app's dialog for now, and
+            // presets do not carry them, so headless runs take the defaults.
+            ..Default::default()
         },
     };
 

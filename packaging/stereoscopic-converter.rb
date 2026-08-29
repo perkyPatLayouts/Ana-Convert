@@ -18,7 +18,7 @@
 #~ That is the file to copy into the tap. Filling the digest in by hand is how a
 #~ cask ends up pinning the wrong bytes.
 cask "stereoscopic-converter" do
-  version "0.1.0"
+  version "0.10.0"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
 
   url "https://github.com/perkyPatLayouts/Ana-Convert/releases/download/v#{version}/StereoscopicConverter-#{version}.dmg"

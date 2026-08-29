@@ -155,6 +155,16 @@ image.
 The icon is drawn by `packaging/make-icon.py` rather than checked in, so there
 is no binary asset to lose and the design can be read.
 
+The sample clip in the user guide is drawn the same way, by
+`docs/make-sample.py` — a ten-second side-by-side scene with known depths, built
+so that a ridge sits behind the screen, a post exactly on it, and a ball far
+enough in front to fringe badly. Known depths are the point: what Convergence
+does to it can be checked against what it should do. The script verifies its own
+output rather than trusting ffmpeg's exit code, and
+`crates/ana-pipeline/tests/sample_clip.rs` holds the committed file to the shape
+the guide describes — including that its two halves actually differ, since a
+stereo sample whose eyes match is a 2D sample.
+
 The figures in the user guide are generated the same way, by
 `docs/make-figures.py`, which builds a synthetic stereo scene and runs the real
 converter over it. A figure therefore cannot claim something the code does not

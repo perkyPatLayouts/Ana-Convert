@@ -24,7 +24,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGING = ROOT / "packaging"
 APP = ROOT / "target" / "Stereoscopic Converter.app"
-BINARY = "ana-convert-app"
+# Cargo target names cannot contain spaces, so the binary is built under a
+# hyphenated name and installed into the bundle under the one people see — in
+# the Dock, in Activity Monitor, and in `CFBundleExecutable`, which has to match
+# the file on disk exactly.
+BUILT_BINARY = "stereoscopic-converter"
+BINARY = "Stereoscopic Converter"
 ENTITLEMENTS = PACKAGING / "entitlements.plist"
 CASK = PACKAGING / "stereoscopic-converter.rb"
 # Anything under these prefixes ships with macOS and must not be copied.
@@ -114,7 +119,7 @@ def main():
 
     print("building release binary…")
     run(["cargo", "build", "--release", "-p", "ana-app"], cwd=ROOT)
-    built = ROOT / "target" / "release" / BINARY
+    built = ROOT / "target" / "release" / BUILT_BINARY
     if not built.exists():
         sys.exit(f"{built} was not produced")
 

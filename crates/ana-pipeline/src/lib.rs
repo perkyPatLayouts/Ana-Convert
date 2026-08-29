@@ -610,6 +610,33 @@ mod tests {
     }
 
     #[test]
+    fn audio_is_dropped_when_it_is_not_asked_for() {
+        // Turning off pass-through in the app leaves `audio` unset on a film
+        // that does have a track. The existing silent-source test cannot see
+        // this: there the track was missing rather than declined.
+        let t = tools();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let noisy = dir.path().join("noisy.mp4");
+        make_test_clip(&t, &noisy, 32, 32, 4, 10.0);
+        assert!(
+            probe(&t, &noisy).expect("probe").has_audio,
+            "the fixture is meant to have a track to decline"
+        );
+
+        let mut job = job(dir.path(), &noisy, "out.mp4");
+        job.audio = None;
+        let summary = render(&t, &job, &mut ignore, &AtomicBool::new(false)).expect("render");
+        assert_eq!(summary.frames, 4);
+
+        assert!(
+            !probe(&t, &dir.path().join("out.mp4"))
+                .expect("probe the result")
+                .has_audio,
+            "audio was carried over after being turned off"
+        );
+    }
+
+    #[test]
     fn a_colour_source_at_another_resolution_is_used_anyway() {
         // A 2D release of the same film is very often a different resolution
         // from the anaglyph rip. Refusing it would be useless when the user has

@@ -11,7 +11,7 @@ name = "ana_app"
 path = "src/lib.rs"
 
 [[bin]]
-name = "ana-convert-app"
+name = "stereoscopic-converter"
 path = "src/main.rs"
 
 [dependencies]
@@ -26,4 +26,4 @@ serde_json.workspace = true
 [dev-dependencies]
 ana-media = { path = "../ana-media", features = ["fixtures"] }
 tempfile = "3"
-egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }

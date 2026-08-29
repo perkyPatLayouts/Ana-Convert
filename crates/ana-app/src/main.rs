@@ -61,13 +61,16 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Stereoscopic Converter")
-            // Ask for a tall window and let macOS clamp it to the display, so
-            // the settings column arrives whole on a big screen and merely
-            // scrolls on a small one.
-            .with_inner_size([1380.0, 1200.0])
+            .with_title(ana_app::app::APP_NAME)
+            // Ask for a window tall enough to hold the settings column and let
+            // macOS clamp it to the display, so the column arrives whole on a
+            // big screen and merely scrolls on a small one. The clamp only ever
+            // shrinks, so asking for too little cuts the column off on screens
+            // with room to spare — which is why the height is a checked
+            // constant rather than a number typed here.
+            .with_inner_size(ana_app::app::STARTUP_WINDOW)
             .with_clamp_size_to_monitor_size(true)
-            .with_min_inner_size([1000.0, 700.0]),
+            .with_min_inner_size(ana_app::app::MINIMUM_WINDOW),
         ..Default::default()
     };
     eframe::run_native(

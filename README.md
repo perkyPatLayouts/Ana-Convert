@@ -64,6 +64,12 @@ itself, not an approximation of it. Then choose a destination and convert.
 The [User Guide](docs/USER-GUIDE.md) covers every control and how to tune them.
 There is also a Help button in the app.
 
+If you have no stereo footage to hand, there is a ten-second one to learn on:
+[docs/sample/stereo-sample-sbs.mp4](docs/sample/stereo-sample-sbs.mp4). It is a
+side-by-side pair with something behind the screen, something exactly on it and
+something well in front, so every control has a visible effect — including the
+one case nothing fixes.
+
 For batch work there is a command line:
 
 ```bash
